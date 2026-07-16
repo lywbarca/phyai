@@ -186,6 +186,17 @@ class _NormalizeBase(ProcessorStep):
             )
         self._tensor_stats = nested
 
+    @staticmethod
+    def _stats_for_value(
+        stats: dict[str, torch.Tensor], value: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        return {
+            name: stat.to(device=value.device)
+            if stat.device != value.device
+            else stat
+            for name, stat in stats.items()
+        }
+
     def _apply(self, transition: Transition, inverse: bool) -> Transition:
         out = transition.copy()
         fn = _unnormalize_field if inverse else _normalize_field
@@ -199,7 +210,10 @@ class _NormalizeBase(ProcessorStep):
             stats = self._tensor_stats.get(name)
             if not stats:
                 continue
-            out[field_name] = fn(out[field_name], mode, stats, self.eps)
+            value = out[field_name]
+            if isinstance(value, torch.Tensor):
+                stats = self._stats_for_value(stats, value)
+            out[field_name] = fn(value, mode, stats, self.eps)
         return out
 
 

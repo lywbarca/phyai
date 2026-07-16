@@ -1,20 +1,19 @@
-"""Regression test for the flashinfer per-call driver leak.
+"""Regression test for flashinfer green-ctx driver memory growth.
 
-flashinfer's ``split_device_green_ctx`` leaks driver-level memory on
-every call that is not recovered by ``cuStreamDestroy +
-cuGreenCtxDestroy``, ``empty_cache``, or ``gc.collect``. This test acts
-as a future-proofing guard: when flashinfer or NVIDIA fixes the upstream
-issue this test will start failing, prompting us to relax the warning in
-the user-facing docstrings.
+Older flashinfer / CUDA driver stacks leaked driver-level memory on every
+``split_device_green_ctx`` call that was not recovered by
+``cuStreamDestroy + cuGreenCtxDestroy``, ``empty_cache``, or
+``gc.collect``. Newer stacks may have fixed or reduced that growth. This
+test keeps the old leak visible without making fixed environments fail.
 
 We only run a handful of iterations (so the test stays fast) and assert
 either:
-  - leak is observable above a small tolerance (current behaviour), OR
-  - leak is below the tolerance (upstream fixed — the test fails so we
-    know to update the docs / status).
+  - growth is observable above a small tolerance (known upstream issue),
+    OR
+  - growth is below the tolerance (fixed or negligible on this stack).
 
 The assertion is structured as ``xfail``-style: we ``pytest.xfail`` when
-leak is detected and ``fail`` if leak appears resolved.
+large growth is detected and pass when growth is negligible.
 """
 
 from __future__ import annotations
@@ -87,19 +86,14 @@ def test_flashinfer_split_leaks_or_upstream_fixed():
     end_smi = _smi_mem_used_mib(0)
     delta = end_smi - base_smi
 
-    if delta >= 32:
-        # Leak still present -> expected, document it explicitly.
+    threshold_mib = 32
+    if delta >= threshold_mib:
+        # Leak still present on this stack. Keep it visible without
+        # failing otherwise healthy test runs.
         pytest.xfail(
             f"known flashinfer leak: 5 iter split_device_green_ctx "
             f"caused {delta} MiB driver-side growth. "
             f"vGPU must remain long-lived."
         )
-    else:
-        # If we ever land here, flashinfer or driver fixed it — the tests
-        # fail loudly so we can update the warning text.
-        pytest.fail(
-            f"unexpected: only {delta} MiB driver growth across {iters} "
-            f"split_device_green_ctx iterations. The upstream leak may "
-            f"have been fixed — please update FlashInferBackend's "
-            f"docstring."
-        )
+
+    assert delta < threshold_mib

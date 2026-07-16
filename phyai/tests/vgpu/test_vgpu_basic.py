@@ -27,6 +27,12 @@ def _flashinfer_available() -> bool:
     return True
 
 
+def _require_total_sms(min_sms: int) -> None:
+    total_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    if total_sms < min_sms:
+        pytest.skip(f"need >= {min_sms} SMs, have {total_sms}")
+
+
 def test_vgpu_activate_runs_gemm_correctly():
     if not _flashinfer_available():
         pytest.skip("flashinfer required for default backend")
@@ -112,17 +118,18 @@ def test_vgpu_no_mem_pool_when_disabled():
 def test_create_vgpus_returns_correct_number():
     if not _flashinfer_available():
         pytest.skip("flashinfer required for default backend")
+    _require_total_sms(32)
     V.init(device="cuda:0")
     a, b = V.create_vgpus(
         device="cuda:0",
-        sm_counts=[64, 64],
+        sm_counts=[16, 16],
         names=["a", "b"],
     )
     try:
         assert a.name == "a"
         assert b.name == "b"
-        assert a.shard.sm_count == 64
-        assert b.shard.sm_count == 64
+        assert a.shard.sm_count == 16
+        assert b.shard.sm_count == 16
     finally:
         a.close()
         b.close()

@@ -6,12 +6,13 @@ Wraps :func:`flashinfer.green_ctx.split_device_green_ctx` and
 best-effort ``destroy`` that calls ``cuStreamDestroy + cuGreenCtxDestroy``
 on the stream's bound green ctx.
 
-flashinfer's ``split_device_*`` leaks driver memory on every call — none
-of ``cuStreamDestroy``, ``cuGreenCtxDestroy``, ``torch.cuda.empty_cache``,
-or process-side ``gc`` recover it. This is an upstream issue (likely in
-flashinfer or the CUDA driver layer). The defensive posture in phyai is
-to keep vGPU objects long-lived; this ``destroy`` keeps things from
-getting strictly worse but does not fix the root cause.
+Some flashinfer / CUDA driver stacks leak driver memory on
+``split_device_*`` calls; older combinations did not recover it with
+``cuStreamDestroy``, ``cuGreenCtxDestroy``, ``torch.cuda.empty_cache``,
+or process-side ``gc``. Newer combinations may have fixed or reduced the
+growth. The defensive posture in phyai is still to keep vGPU objects
+long-lived; this ``destroy`` keeps things from getting strictly worse on
+affected stacks but cannot fix upstream driver-side growth.
 """
 
 from __future__ import annotations
@@ -103,8 +104,9 @@ class FlashInferBackend:
 
         Recovers the green-ctx handle via ``cuStreamGetGreenCtx`` (the
         ``CUdevResource`` flashinfer hands us doesn't carry the green ctx
-        itself, only the SM resource description). Even with this cleanup
-        the per-call driver leak persists; see module docstring.
+        itself, only the SM resource description). On affected stacks,
+        driver-side growth may remain after this cleanup; see module
+        docstring.
         """
         try:
             import cuda.bindings.driver as cu

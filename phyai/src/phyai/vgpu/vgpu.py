@@ -30,13 +30,12 @@ class vGPU:
 
     .. warning::
 
-       vGPUs **must be long-lived**. flashinfer's
-       ``split_device_green_ctx`` leaks driver memory on every call;
-       ``cuStreamDestroy + cuGreenCtxDestroy`` plus ``empty_cache``
-       recover none of it. The leak is upstream — likely in flashinfer or
-       the CUDA driver layer — so the defensive posture in phyai is to
-       keep vGPU objects long-lived. Creating and destroying vGPUs on a
-       request hot path will exhaust device memory.
+       vGPUs should be long-lived. Some flashinfer / CUDA driver stacks
+       leak driver memory on ``split_device_green_ctx`` calls, and older
+       combinations did not recover it with ``cuStreamDestroy +
+       cuGreenCtxDestroy`` plus ``empty_cache``. Even when newer stacks
+       reduce that growth, repeatedly creating and destroying vGPUs on a
+       request hot path is expensive and should be avoided.
     """
 
     name: str
@@ -151,9 +150,9 @@ def create_vgpus(
 
     .. warning::
 
-       Long-lived usage only. flashinfer's per-call driver leak means
-       re-creating vGPUs in a request hot path will exhaust device
-       memory; see :class:`vGPU` docstring.
+       Prefer long-lived usage. Some flashinfer / CUDA driver stacks
+       show per-call driver memory growth, and recreating vGPUs in a
+       request hot path is expensive; see :class:`vGPU` docstring.
 
     Args:
         device: CUDA device (string or :class:`torch.device`).

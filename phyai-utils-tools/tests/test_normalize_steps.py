@@ -44,6 +44,19 @@ def test_quantiles_roundtrip():
     assert torch.allclose(back, x, atol=1e-5)
 
 
+def test_unnormalizer_moves_stats_to_tensor_device():
+    if not torch.cuda.is_available():
+        return
+    feats = {"action": {"type": "ACTION", "shape": [2]}}
+    stats = {"action": {"q01": [0.0, 10.0], "q99": [2.0, 14.0]}}
+    step = UnnormalizerStep(features=feats, norm_map={"ACTION": "QUANTILES"}, stats=stats)
+
+    out = step({ACTION: torch.tensor([[-1.0, 0.0]], device="cuda")})[ACTION]
+
+    assert out.device.type == "cuda"
+    torch.testing.assert_close(out.cpu(), torch.tensor([[0.0, 12.0]]))
+
+
 def test_quantile10_roundtrip():
     stats = {_STATE_FEAT: {"q10": [-1.0, -2.0, 0.0], "q90": [1.0, 2.0, 1.0]}}
     x, _, back = _roundtrip("QUANTILE10", stats)
