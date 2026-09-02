@@ -7,7 +7,9 @@ tokenization remain outside this file.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -34,6 +36,35 @@ def _get_field(inputs: Any, name: str, default: Any = None) -> Any:
     return getattr(inputs, name, default)
 
 
+def _reference_vae_trace_tensor(name: str, value: torch.Tensor) -> None:
+    trace_dir = os.getenv("DREAMZERO_DIT_DETAIL_TRACE_DIR")
+    enabled = os.getenv("DREAMZERO_DIT_TRACE_REFERENCE", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    if not trace_dir or not enabled:
+        return
+    os.makedirs(trace_dir, exist_ok=True)
+    torch.save(
+        value.detach().cpu(),
+        os.path.join(trace_dir, f"reference_VAE.{name}.pt"),
+    )
+
+
+def _encoder_boundary_trace_tensor(
+    request_index: int, name: str, value: torch.Tensor
+) -> None:
+    trace_dir = os.getenv("DREAMZERO_ENCODER_BOUNDARY_TRACE_DIR")
+    if not trace_dir:
+        return
+    os.makedirs(trace_dir, exist_ok=True)
+    torch.save(
+        value.detach().cpu(),
+        os.path.join(trace_dir, f"request{request_index:02d}.{name}.pt"),
+    )
+
+
 def dreamzero_images_to_video_tensor(
     images: torch.Tensor,
     *,
@@ -55,12 +86,11 @@ def dreamzero_images_to_video_tensor(
     if device is None:
         device = images.device
     if images.dtype == torch.uint8:
-        video = (
-            images.to(device=device, dtype=torch.float32).mul_(2.0 / 255.0).sub_(1.0)
-        )
+        video = images.to(device=device, dtype=dtype)
+        video.div_(255.0).mul_(2.0).sub_(1.0)
     else:
-        video = images.to(device=device, dtype=torch.float32)
-    return video.permute(0, 4, 1, 2, 3).contiguous().to(dtype=dtype)
+        video = images.to(device=device, dtype=dtype)
+    return video.permute(0, 4, 1, 2, 3).contiguous()
 
 
 def dreamzero_generate_noise(
@@ -118,14 +148,14 @@ class DreamZeroMinimalPipeline:
         self.seed = seed
         self.sequential_cpu_offload = bool(sequential_cpu_offload)
         self.encoder_rank0_broadcast = bool(encoder_rank0_broadcast)
+        self._condition: DreamZeroFirstFrameCondition | None = None
+        self._encoder_boundary_trace_index = 0
 
     @property
     def _is_encoder_rank(self) -> bool:
         return not self.encoder_rank0_broadcast or dist.get_rank() == 0
 
-    def _broadcast_encoder_tensor(
-        self, value: torch.Tensor | None
-    ) -> torch.Tensor:
+    def _broadcast_encoder_tensor(self, value: torch.Tensor | None) -> torch.Tensor:
         if not self.encoder_rank0_broadcast:
             if value is None:
                 raise RuntimeError("encoder returned no tensor")
@@ -165,11 +195,21 @@ class DreamZeroMinimalPipeline:
                 raise RuntimeError("encoder rank has no text encoder")
             self._activate(self.text_encoder.text_encoder)
             try:
-                context = self.text_encoder.encode_prompt(
+                encode_positive = getattr(
+                    self.text_encoder,
+                    "encode_positive_prompt",
+                    self.text_encoder.encode_prompt,
+                )
+                encode_negative = getattr(
+                    self.text_encoder,
+                    "encode_negative_prompt",
+                    self.text_encoder.encode_prompt,
+                )
+                context = encode_positive(
                     _get_field(processed, "input_ids"),
                     _get_field(processed, "attention_mask"),
                 )
-                uncond_context = self.text_encoder.encode_prompt(
+                uncond_context = encode_negative(
                     _get_field(processed, "negative_input_ids"),
                     _get_field(processed, "negative_attention_mask"),
                 )
@@ -188,7 +228,10 @@ class DreamZeroMinimalPipeline:
             raise ValueError(
                 f"videos must have shape [B, C, T, H, W], got {tuple(videos.shape)}."
             )
-        first_frame = videos[:, :, :1].transpose(1, 2).contiguous()
+        # Official real-world inference reconditions on the latest observed
+        # frame when a multi-frame request starts a new attention window.
+        frame = videos[:, :, -1:] if videos.shape[2] in (4, 9) else videos[:, :, :1]
+        first_frame = frame.transpose(1, 2).contiguous()
         batch_size, _, channels, height, width = first_frame.shape
         if channels != 3:
             raise ValueError(f"first frame must have 3 channels, got {channels}.")
@@ -236,6 +279,7 @@ class DreamZeroMinimalPipeline:
                         self.config.tile_stride_height,
                         self.config.tile_stride_width,
                     ),
+                    use_autocast=True,
                 )
             finally:
                 self._offload(self.vae.vae)
@@ -256,13 +300,76 @@ class DreamZeroMinimalPipeline:
             clean_video=latents[:, :, 0:1].to(self.device, self.dtype),
         )
 
+    def encode_reference_video(self, videos: torch.Tensor) -> torch.Tensor:
+        if videos.dim() != 5:
+            raise ValueError(
+                f"videos must have shape [B, C, T, H, W], got {tuple(videos.shape)}."
+            )
+        if videos.shape[2] <= 1:
+            raise ValueError("reference video requires more than one input frame.")
+
+        vae_input = videos
+        num_frames = int(vae_input.shape[2])
+        frames_per_block = int(self.config.num_frame_per_block)
+        if (num_frames - 1) // 4 != frames_per_block:
+            observed_blocks = num_frames // 4
+            if observed_blocks <= 0:
+                raise ValueError(
+                    "reference video must contain at least four observed frames; "
+                    f"got {num_frames}."
+                )
+            if observed_blocks != frames_per_block:
+                if frames_per_block % observed_blocks != 0:
+                    raise ValueError(
+                        "reference video frames cannot be aligned to "
+                        f"num_frame_per_block={frames_per_block}: got {num_frames}."
+                    )
+                vae_input = torch.repeat_interleave(
+                    vae_input,
+                    frames_per_block // observed_blocks,
+                    dim=2,
+                )
+            vae_input = torch.cat([vae_input[:, :, :1], vae_input], dim=2)
+        vae_input = vae_input.to(self.device, self.dtype)
+        _reference_vae_trace_tensor("input", vae_input)
+        latents = None
+        if self._is_encoder_rank:
+            if self.vae is None:
+                raise RuntimeError("encoder rank has no VAE")
+            self._activate(self.vae.vae)
+            try:
+                latents = self.vae.encode(
+                    vae_input,
+                    tiled=self.config.tiled,
+                    tile_size=(
+                        self.config.tile_size_height,
+                        self.config.tile_size_width,
+                    ),
+                    tile_stride=(
+                        self.config.tile_stride_height,
+                        self.config.tile_stride_width,
+                    ),
+                    use_autocast=False,
+                )
+            finally:
+                self._offload(self.vae.vae)
+        latents = self._broadcast_encoder_tensor(latents)
+        _reference_vae_trace_tensor("output_full", latents)
+        return latents[:, :, -self.config.num_frame_per_block :].to(
+            self.device, self.dtype
+        )
+
     def build_request(
         self,
         processed: Any,
         *,
         guidance_scale: float | None = None,
-        current_start_frame: int = 1,
-        prefill_clean_cache: bool = True,
+        current_start_frame: int | None = None,
+        num_inference_steps: int | None = None,
+        dynamic_dit: bool = False,
+        dynamic_dit_scheduler_steps: int = 16,
+        prefill_clean_cache: bool | None = None,
+        reset_kv_cache: bool | None = None,
     ) -> DreamZeroRequest:
         images = _get_field(processed, "images")
         if images is None:
@@ -277,8 +384,165 @@ class DreamZeroMinimalPipeline:
             device=self.device,
             dtype=self.dtype,
         )
+        encoder_trace_request_index = self._encoder_boundary_trace_index
+        if os.getenv("DREAMZERO_ENCODER_BOUNDARY_TRACE_DIR"):
+            self._encoder_boundary_trace_index += 1
         context, uncond_context = self.encode_text(processed)
-        condition = self.encode_first_frame_condition(videos)
+        _encoder_boundary_trace_tensor(
+            encoder_trace_request_index, "text_context0", context
+        )
+        _encoder_boundary_trace_tensor(
+            encoder_trace_request_index, "text_context1", uncond_context
+        )
+        reference_encoder_dir = os.getenv("DREAMZERO_REFERENCE_ENCODER_TRACE_DIR")
+        reference_encoder_components = {
+            component.strip().lower()
+            for component in os.getenv(
+                "DREAMZERO_REFERENCE_ENCODER_COMPONENTS", "text,clip,vae"
+            ).split(",")
+            if component.strip()
+        }
+        unknown_reference_components = reference_encoder_components - {
+            "text",
+            "clip",
+            "vae",
+        }
+        if unknown_reference_components:
+            raise ValueError(
+                "Unknown DREAMZERO_REFERENCE_ENCODER_COMPONENTS: "
+                f"{sorted(unknown_reference_components)}"
+            )
+        if reference_encoder_dir and "text" in reference_encoder_components:
+            reference_path = Path(reference_encoder_dir)
+            positive_path = reference_path / "request00.text_context0.pt"
+            negative_path = reference_path / "request00.text_context1.pt"
+            if positive_path.exists() or negative_path.exists():
+                if not positive_path.exists() or not negative_path.exists():
+                    raise FileNotFoundError(
+                        "Reference text boundary trace must contain both "
+                        "request00.text_context0.pt and request00.text_context1.pt."
+                    )
+                context = torch.load(
+                    positive_path,
+                    map_location=self.device,
+                    weights_only=True,
+                ).to(self.device, self.dtype)
+                uncond_context = torch.load(
+                    negative_path,
+                    map_location=self.device,
+                    weights_only=True,
+                ).to(self.device, self.dtype)
+            else:
+                context = torch.load(
+                    reference_path / "DiT_step_00.branch0.model.raw_text_context.pt",
+                    map_location=self.device,
+                    weights_only=True,
+                ).to(self.device, self.dtype)
+        start_frame = (
+            self.scheduler.current_start_frame
+            if current_start_frame is None
+            else int(current_start_frame)
+        )
+        if (
+            reset_kv_cache is None
+            and self.scheduler.local_attn_size != -1
+            and start_frame >= self.scheduler.local_attn_size
+        ):
+            reset_kv_cache = True
+            start_frame = 0
+        if reset_kv_cache is None and self._condition is None:
+            reset_kv_cache = True
+            start_frame = 0
+        if reset_kv_cache is None and start_frame != 0 and videos.shape[2] == 1:
+            reset_kv_cache = True
+            start_frame = 0
+        reset_sequence = start_frame == 0 if reset_kv_cache is None else reset_kv_cache
+        if reset_sequence:
+            # Release the previous attention window before image/VAE
+            # reconditioning. Waiting until scheduler.step() keeps both the old
+            # multi-gigabyte KV cache and the new encoder working set alive.
+            self.scheduler.reset_sequence()
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+        if reset_sequence or self._condition is None:
+            condition = self.encode_first_frame_condition(videos)
+            if reference_encoder_dir and reference_encoder_components & {
+                "clip",
+                "vae",
+            }:
+                reference_path = Path(reference_encoder_dir)
+                clip_feature = condition.clip_feature
+                y = condition.y
+                clean_video = condition.clean_video
+                if "clip" in reference_encoder_components:
+                    clip_feature = torch.load(
+                        reference_path
+                        / "DiT_step_00.branch0.model.raw_clip_feature.pt",
+                        map_location=self.device,
+                        weights_only=True,
+                    ).to(self.device, self.dtype)
+                if "vae" in reference_encoder_components:
+                    denoise_y = torch.load(
+                        reference_path
+                        / "DiT_step_00.branch0.model.video.condition_y.pt",
+                        map_location=self.device,
+                        weights_only=True,
+                    ).to(self.device, self.dtype)
+                    warmup_y_path = (
+                        reference_path
+                        / "first-frame_KV_warmup.branch0.model.video.condition_y.pt"
+                    )
+                    warmup_video_path = (
+                        reference_path
+                        / "first-frame_KV_warmup.branch0.model.video.input.pt"
+                    )
+                    if warmup_y_path.exists() != warmup_video_path.exists():
+                        raise FileNotFoundError(
+                            "Reference encoder trace must contain both warmup condition_y "
+                            "and warmup video input."
+                        )
+                    if warmup_y_path.exists():
+                        warmup_y = torch.load(
+                            warmup_y_path,
+                            map_location=self.device,
+                            weights_only=True,
+                        ).to(self.device, self.dtype)
+                        clean_video = torch.load(
+                            warmup_video_path,
+                            map_location=self.device,
+                            weights_only=True,
+                        ).to(self.device, self.dtype)
+                        if warmup_y.shape[2] != 1 or clean_video.shape[2] != 1:
+                            raise ValueError(
+                                "Reference warmup tensors must contain exactly one frame."
+                            )
+                        y = torch.cat([warmup_y, denoise_y], dim=2)
+                    else:
+                        y = denoise_y
+                        clean_video = y[:, 4:, :1]
+                condition = DreamZeroFirstFrameCondition(
+                    clip_feature=clip_feature,
+                    y=y,
+                    clean_video=clean_video,
+                )
+            self._condition = condition
+            start_frame = 0 if reset_sequence else start_frame
+        else:
+            condition = self._condition
+        _encoder_boundary_trace_tensor(
+            encoder_trace_request_index, "clip_feature", condition.clip_feature
+        )
+        _encoder_boundary_trace_tensor(
+            encoder_trace_request_index, "condition_y", condition.y
+        )
+        _encoder_boundary_trace_tensor(
+            encoder_trace_request_index, "clean_video", condition.clean_video
+        )
+
+        reference_video = None
+        if not reset_sequence and start_frame != 1 and videos.shape[2] > 1:
+            reference_video = self.encode_reference_video(videos)
+
         batch_size = videos.shape[0]
         latent_h, latent_w = condition.clean_video.shape[3:5]
         noise_video = dreamzero_generate_noise(
@@ -316,17 +580,22 @@ class DreamZeroMinimalPipeline:
             clip_feature=condition.clip_feature,
             y=condition.y,
             clean_video=condition.clean_video,
+            reference_video=reference_video,
             uncond_context=uncond_context if use_cfg else None,
             uncond_clip_feature=condition.clip_feature if use_cfg else None,
             seq_len=seq_len,
-            current_start_frame=current_start_frame,
+            current_start_frame=start_frame,
             concat_first_frame_latent=True,
             image_context_tokens=condition.clip_feature.shape[1],
+            num_inference_steps=num_inference_steps,
+            dynamic_dit=dynamic_dit,
+            dynamic_dit_scheduler_steps=dynamic_dit_scheduler_steps,
             guidance_scale=guidance_scale,
             sigma_shift=self.config.sigma_shift,
             decouple_inference_noise=self.config.decouple_inference_noise,
             video_inference_final_noise=self.config.video_inference_final_noise,
             prefill_clean_cache=prefill_clean_cache,
+            reset_kv_cache=reset_kv_cache,
         )
 
     @torch.no_grad()
@@ -335,8 +604,21 @@ class DreamZeroMinimalPipeline:
         processed: Any,
         *,
         guidance_scale: float | None = None,
+        current_start_frame: int | None = None,
+        num_inference_steps: int | None = None,
+        dynamic_dit: bool = False,
+        dynamic_dit_scheduler_steps: int = 16,
+        reset_kv_cache: bool | None = None,
     ) -> DreamZeroPipelineOutput:
-        request = self.build_request(processed, guidance_scale=guidance_scale)
+        request = self.build_request(
+            processed,
+            guidance_scale=guidance_scale,
+            current_start_frame=current_start_frame,
+            num_inference_steps=num_inference_steps,
+            dynamic_dit=dynamic_dit,
+            dynamic_dit_scheduler_steps=dynamic_dit_scheduler_steps,
+            reset_kv_cache=reset_kv_cache,
+        )
         self._activate(self.scheduler.model)
         try:
             scheduler_output = self.scheduler.step(request)

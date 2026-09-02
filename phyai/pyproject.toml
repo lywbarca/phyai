@@ -14,7 +14,9 @@ dependencies = [
     "flash-linear-attention>=0.5.1",
     "transformers==5.8.1",
     "huggingface-hub",
+    "msgpack",
     "tqdm",
+    "websockets",
 ]
 
 [project.optional-dependencies]

@@ -183,7 +183,9 @@ def build_dreamzero_minimal_pipeline(
             ).eval()
             image_encoder = DreamZeroWanImageEncoder(
                 config.image_encoder,
-                params_dtype=dtype,
+                # Match the official CLIP load path before the cast below. Direct
+                # BF16 construction changes full-graph Inductor numerics on Thor.
+                params_dtype=torch.float32,
             ).eval()
             vae = DreamZeroWanVAE(config.vae).eval()
         else:
@@ -251,9 +253,7 @@ def build_dreamzero_minimal_pipeline(
         else None
     )
     vae_runner = (
-        DreamZeroVAERunner(vae, device=device, dtype=dtype)
-        if encoder_rank
-        else None
+        DreamZeroVAERunner(vae, device=device, dtype=dtype) if encoder_rank else None
     )
 
     if options.setup_encoders and encoder_rank:

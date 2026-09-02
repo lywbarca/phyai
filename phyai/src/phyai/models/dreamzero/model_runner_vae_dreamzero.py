@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from phyai.models.dreamzero.vae_wan import DreamZeroWanVAE
@@ -23,7 +25,14 @@ class DreamZeroVAERunner(ModelRunner):
         self.dtype = dtype
 
     def setup(self) -> None:
-        return None
+        if os.getenv("DREAMZERO_COMPILE_VAE", "false").lower() == "true":
+            compile_mode = os.getenv("DREAMZERO_VAE_COMPILE_MODE", "reduce-overhead")
+            self.vae.model.encode = torch.compile(
+                self.vae.model.encode,
+                mode=compile_mode,
+                fullgraph=True,
+                dynamic=False,
+            )
 
     @torch.no_grad()
     def encode(
@@ -33,9 +42,19 @@ class DreamZeroVAERunner(ModelRunner):
         tiled: bool = False,
         tile_size: tuple[int, int] = (34, 34),
         tile_stride: tuple[int, int] = (18, 16),
+        use_autocast: bool = True,
     ) -> torch.Tensor:
+        pixels = pixels.to(self.device, self.dtype)
+        if use_autocast and self.device.type == "cuda":
+            with torch.autocast(device_type="cuda", dtype=self.dtype):
+                return self.vae.encode(
+                    pixels,
+                    tiled=tiled,
+                    tile_size=tile_size,
+                    tile_stride=tile_stride,
+                )
         return self.vae.encode(
-            pixels.to(self.device, self.dtype),
+            pixels,
             tiled=tiled,
             tile_size=tile_size,
             tile_stride=tile_stride,

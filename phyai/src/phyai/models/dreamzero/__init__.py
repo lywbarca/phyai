@@ -36,7 +36,6 @@ from phyai.models.dreamzero.modeling_dreamzero import (
     dreamzero_dit_weight_remap,
 )
 from phyai.models.dreamzero.model_runner_dreamzero import (
-    DreamZeroLayerKVCache,
     DreamZeroDiTForwardBatch,
     DreamZeroDiTForwardOutput,
     DreamZeroDiTRunner,
@@ -99,7 +98,6 @@ __all__ = [
     "DreamZeroWanImageEncoder",
     "WanCLIPVisionTransformer",
     "WanXLMRobertaCLIPVisual",
-    "DreamZeroLayerKVCache",
     "DreamZeroDiTForwardBatch",
     "DreamZeroDiTForwardOutput",
     "DreamZeroDiTRunner",

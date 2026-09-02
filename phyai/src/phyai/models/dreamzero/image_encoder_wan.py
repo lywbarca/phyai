@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import math
+import os
+from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
 
 from phyai.models.dreamzero.configuration_dreamzero import DreamZeroImageEncoderConfig
 from phyai.weights.shards import replicated
@@ -14,6 +17,15 @@ from phyai.weights.shards import replicated
 
 CLIP_IMAGE_MEAN = (0.48145466, 0.4578275, 0.40821073)
 CLIP_IMAGE_STD = (0.26862954, 0.26130258, 0.27577711)
+
+
+def _clip_detail_save(name: str, value: object) -> None:
+    trace_dir = os.getenv("DREAMZERO_DIT_DETAIL_TRACE_DIR")
+    if not trace_dir or not isinstance(value, torch.Tensor):
+        return
+    path = Path(trace_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    torch.save(value.detach().cpu(), path / f"CLIP.{name}.pt")
 
 
 def attach_replicated_image_encoder_weights(module: nn.Module) -> None:
@@ -93,16 +105,15 @@ class CLIPSelfAttention(nn.Module):
         self.proj = nn.Linear(dim, dim, dtype=params_dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch, seq_len, dim = x.shape
         q, k, v = self.to_qkv(x).chunk(3, dim=-1)
-        q = q.view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        dropout_p = self.attn_dropout if self.training else 0.0
-        x = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
-        x = x.transpose(1, 2).reshape(batch, seq_len, dim)
+        q = rearrange(q, "b s (n d) -> b n s d", n=self.num_heads)
+        k = rearrange(k, "b s (n d) -> b n s d", n=self.num_heads)
+        v = rearrange(v, "b s (n d) -> b n s d", n=self.num_heads)
+        x = F.scaled_dot_product_attention(q, k, v)
+        x = rearrange(x, "b n s d -> b s (n d)", n=self.num_heads)
         x = self.proj(x)
-        return F.dropout(x, self.proj_dropout, self.training)
+        x = F.dropout(x, self.proj_dropout, self.training)
+        return x
 
 
 class SwiGLU(nn.Module):
@@ -160,9 +171,9 @@ class CLIPAttentionBlock(nn.Module):
         if self.post_norm:
             x = x + self.norm1(self.attn(x))
             x = x + self.norm2(self.mlp(x))
-            return x
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
+        else:
+            x = x + self.attn(self.norm1(x))
+            x = x + self.mlp(self.norm2(x))
         return x
 
 
@@ -300,19 +311,13 @@ class WanCLIPVisionTransformer(nn.Module):
 
     def forward(
         self,
-        pixel_values: torch.Tensor,
-        *,
+        x: torch.Tensor,
         interpolation: bool = False,
-        use_31_block: bool | None = None,
+        use_31_block: bool = False,
         feature_layer: int | None = None,
     ) -> torch.Tensor:
-        if pixel_values.dim() != 4:
-            raise ValueError(
-                f"pixel_values must be 4-D (B, C, H, W); got "
-                f"shape {tuple(pixel_values.shape)}."
-            )
-        batch = pixel_values.size(0)
-        x = self.patch_embedding(pixel_values).flatten(2).permute(0, 2, 1)
+        batch = x.size(0)
+        x = self.patch_embedding(x).flatten(2).permute(0, 2, 1)
         if self.pool_type in {"token", "token_fc"}:
             x = torch.cat(
                 [
@@ -323,25 +328,29 @@ class WanCLIPVisionTransformer(nn.Module):
                 ],
                 dim=1,
             )
-        pos = (
+        pos_embedding = (
             pos_interpolate(self.pos_embedding, x.size(1))
             if interpolation
             else self.pos_embedding
         )
-        x = self.dropout(x + pos.to(dtype=x.dtype, device=x.device))
+        pos_embedding = pos_embedding.to(dtype=x.dtype, device=x.device)
+        x = self.dropout(x + pos_embedding)
         if self.pre_norm is not None:
             x = self.pre_norm(x)
 
-        if feature_layer is None:
-            feature_layer = (
-                self.config.feature_layer if use_31_block else self.num_layers
-            )
-        if not 0 < feature_layer <= self.num_layers:
+        if feature_layer is not None and not 0 < feature_layer <= self.num_layers:
             raise ValueError(
                 f"feature_layer={feature_layer} must be in [1, {self.num_layers}]."
             )
-        for block in self.transformer[:feature_layer]:
-            x = block(x)
+        if feature_layer is not None:
+            x = self.transformer[:feature_layer](x)
+        elif use_31_block:
+            if self.config.feature_layer == self.num_layers - 1:
+                x = self.transformer[:-1](x)
+            else:
+                x = self.transformer[: self.config.feature_layer](x)
+        else:
+            x = self.transformer(x)
         return x
 
 
@@ -396,6 +405,7 @@ class DreamZeroWanImageEncoder(nn.Module):
 
     def preprocess(self, videos: torch.Tensor | list[torch.Tensor]) -> torch.Tensor:
         """Resize and normalize DreamZero image tensors from [-1, 1] to CLIP input."""
+        _clip_detail_save("input", videos)
         size = (self.config.image_size, self.config.image_size)
         if isinstance(videos, torch.Tensor):
             if videos.dim() == 4:
@@ -419,10 +429,21 @@ class DreamZeroWanImageEncoder(nn.Module):
             mode="bicubic",
             align_corners=False,
         )
+        _clip_detail_save("resized", frames)
         frames = frames.mul(0.5).add(0.5)
-        mean = self.image_mean.to(dtype=frames.dtype, device=frames.device)
-        std = self.image_std.to(dtype=frames.dtype, device=frames.device)
-        return (frames - mean) / std
+        mean = torch.tensor(
+            CLIP_IMAGE_MEAN,
+            dtype=frames.dtype,
+            device=frames.device,
+        ).view(1, 3, 1, 1)
+        std = torch.tensor(
+            CLIP_IMAGE_STD,
+            dtype=frames.dtype,
+            device=frames.device,
+        ).view(1, 3, 1, 1)
+        frames = (frames - mean) / std
+        _clip_detail_save("normalized", frames)
+        return frames
 
     def encode_image(
         self,
@@ -437,6 +458,22 @@ class DreamZeroWanImageEncoder(nn.Module):
         pixel_values = pixel_values.to(
             device=self.model.visual.pos_embedding.device, dtype=dtype
         )
+        visual = self.model.visual
+        for name, value in {
+            "patch_weight": visual.patch_embedding.weight,
+            "pos_embedding": visual.pos_embedding,
+            "block00_norm1_weight": visual.transformer[0].norm1.weight,
+            "block00_norm1_bias": visual.transformer[0].norm1.bias,
+            "block00_qkv_weight": visual.transformer[0].attn.to_qkv.weight,
+            "block00_qkv_bias": visual.transformer[0].attn.to_qkv.bias,
+            "block00_proj_weight": visual.transformer[0].attn.proj.weight,
+            "block00_mlp0_weight": visual.transformer[0].mlp[0].weight,
+            "block00_mlp2_weight": visual.transformer[0].mlp[2].weight,
+            "block30_qkv_weight": visual.transformer[
+                min(30, len(visual.transformer) - 1)
+            ].attn.to_qkv.weight,
+        }.items():
+            _clip_detail_save(name, value)
         return self.model.visual(pixel_values, use_31_block=True).clone()
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:

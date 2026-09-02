@@ -191,6 +191,31 @@ def test_ws1_scheduler_prefills_then_denoises_with_runner() -> None:
     assert out.cond_kv_cache == ["cache"]
 
 
+def test_ws1_scheduler_dynamic_dit_matches_official_skip_schedule() -> None:
+    scheduler = DreamZeroWS1Scheduler(_FakeModel(), device="cpu", use_cfg_runner=False)
+    scheduler.cond_runner = _FakeRunner()
+    scheduler.setup()
+
+    request = DreamZeroRequest(
+        video=torch.zeros(1, 2, 1, 2, 2),
+        action=torch.zeros(1, 2, 4),
+        state=torch.zeros(1, 1, 5),
+        context=torch.zeros(1, 3, 8),
+        image_context_tokens=1,
+        num_inference_steps=1,
+        dynamic_dit=True,
+        dynamic_dit_scheduler_steps=16,
+    )
+    out = scheduler.step(request)
+
+    assert out.scheduler_steps == 16
+    assert out.dit_compute_steps == 4
+    assert len(scheduler.cond_runner.calls) == 4
+    assert all(call.action is not None for call in scheduler.cond_runner.calls)
+    assert torch.isfinite(out.video).all()
+    assert torch.isfinite(out.action).all()
+
+
 def test_ws1_scheduler_slices_full_condition_for_prefill_and_denoise() -> None:
     scheduler = DreamZeroWS1Scheduler(_FakeModel(), device="cpu", use_cfg_runner=False)
     scheduler.cond_runner = _FakeRunner()
@@ -226,6 +251,102 @@ def test_ws1_scheduler_slices_full_condition_for_prefill_and_denoise() -> None:
     assert denoise.y is not None
     assert denoise.y.shape == (1, 22, 2, 2, 2)
     torch.testing.assert_close(denoise.y, request.y[:, :, 1:3])
+
+
+def test_ws1_scheduler_updates_reference_cache_between_chunks() -> None:
+    scheduler = DreamZeroWS1Scheduler(_FakeModel(), device="cpu", use_cfg_runner=False)
+    scheduler.cond_runner = _FakeRunner()
+    scheduler.setup()
+    y = torch.randn(1, 22, 4, 2, 2)
+
+    first = DreamZeroRequest(
+        video=torch.zeros(1, 2, 1, 2, 2),
+        action=torch.zeros(1, 2, 4),
+        state=torch.zeros(1, 1, 5),
+        context=torch.zeros(1, 3, 8),
+        y=y,
+        clean_video=torch.zeros(1, 2, 1, 2, 2),
+        image_context_tokens=1,
+        num_inference_steps=1,
+    )
+    first_out = scheduler.step(first)
+
+    assert first_out.current_start_frame == 2
+    assert len(scheduler.cond_runner.calls) == 2
+    assert scheduler.cond_runner.calls[0].action is None
+    assert scheduler.cond_runner.calls[0].update_kv_cache
+    assert scheduler.cond_runner.calls[0].current_start_frame == 0
+    assert scheduler.cond_runner.calls[1].action is not None
+    assert not scheduler.cond_runner.calls[1].update_kv_cache
+    assert scheduler.cond_runner.calls[1].current_start_frame == 1
+
+    second = DreamZeroRequest(
+        video=torch.zeros(1, 2, 1, 2, 2),
+        action=torch.zeros(1, 2, 4),
+        state=torch.zeros(1, 1, 5),
+        context=torch.zeros(1, 3, 8),
+        y=y,
+        reference_video=torch.ones(1, 2, 1, 2, 2),
+        image_context_tokens=1,
+        num_inference_steps=1,
+    )
+    second_out = scheduler.step(second)
+
+    assert second_out.current_start_frame == 3
+    assert len(scheduler.cond_runner.calls) == 4
+    reference = scheduler.cond_runner.calls[2]
+    denoise = scheduler.cond_runner.calls[3]
+    assert reference.action is None
+    assert reference.update_kv_cache
+    assert reference.current_start_frame == 1
+    assert reference.seq_len is None
+    assert reference.y is not None
+    torch.testing.assert_close(reference.y, y[:, :, 1:2])
+    assert denoise.action is not None
+    assert not denoise.update_kv_cache
+    assert denoise.current_start_frame == 2
+    assert denoise.y is not None
+    torch.testing.assert_close(denoise.y, y[:, :, 2:3])
+
+
+def test_reference_cache_trace_wraps_cond_runner(monkeypatch) -> None:
+    model = _FakeModel()
+    scheduler = DreamZeroWS1Scheduler(model, device="cpu", use_cfg_runner=False)
+    scheduler.cond_runner = _FakeRunner()
+    scheduler.setup()
+    monkeypatch.setenv("DREAMZERO_DIT_TRACE_REFERENCE", "1")
+    observed = []
+
+    def capture(*args, **kwargs):
+        del args, kwargs
+        observed.append(
+            (
+                model._dz_trace_enabled,
+                model._dz_trace_label,
+                model._dz_trace_branch,
+            )
+        )
+
+    scheduler._run_runner = capture
+    request = DreamZeroRequest(
+        video=torch.zeros(1, 2, 1, 2, 2),
+        action=torch.zeros(1, 2, 4),
+        state=torch.zeros(1, 1, 5),
+        context=torch.zeros(1, 3, 8),
+        y=torch.zeros(1, 22, 4, 2, 2),
+    )
+
+    scheduler._update_reference_cache(
+        scheduler.cond_runner,
+        request=request,
+        reference_video=torch.zeros(1, 2, 1, 2, 2),
+        context=request.context,
+        clip_feature=None,
+        current_start_frame=2,
+    )
+
+    assert observed == [(True, "reference_KV_update", 0)]
+    assert not model._dz_trace_enabled
 
 
 def test_ws1_scheduler_cfg_parallel_rank_uses_only_local_branch(fake_mesh) -> None:

@@ -127,7 +127,8 @@ class T5RelativeEmbedding(nn.Module):
             rel_pos_large,
             torch.full_like(rel_pos_large, num_buckets - 1),
         )
-        return rel_buckets + torch.where(rel_pos < max_exact, rel_pos, rel_pos_large)
+        rel_buckets += torch.where(rel_pos < max_exact, rel_pos, rel_pos_large)
+        return rel_buckets
 
 
 class T5Attention(nn.Module):
@@ -168,44 +169,32 @@ class T5Attention(nn.Module):
         q = self.q(x).view(batch_size, -1, self.num_heads, self.head_dim)
         k = self.k(context).view(batch_size, -1, self.num_heads, self.head_dim)
         v = self.v(context).view(batch_size, -1, self.num_heads, self.head_dim)
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
 
-        attn_bias = None
-        if pos_bias is not None or mask is not None:
-            attn_bias = x.new_zeros(
-                batch_size,
-                self.num_heads,
-                q.size(-2),
-                k.size(-2),
-            )
-            if pos_bias is not None:
-                attn_bias = attn_bias + pos_bias.to(dtype=x.dtype, device=x.device)
-            if mask is not None:
-                if mask.ndim not in {2, 3}:
-                    raise ValueError(
-                        f"mask must be 2-D or 3-D; got shape {tuple(mask.shape)}."
-                    )
-                mask = (
-                    mask.view(batch_size, 1, 1, -1)
-                    if mask.ndim == 2
-                    else mask.unsqueeze(1)
-                )
-                attn_bias = attn_bias.masked_fill(
-                    mask.to(device=x.device) == 0,
-                    torch.finfo(x.dtype).min,
-                )
-
-        out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attn_bias,
-            dropout_p=0.0,
-            scale=1.0,
+        attn_bias = x.new_zeros(
+            batch_size,
+            self.num_heads,
+            q.size(1),
+            k.size(1),
         )
-        out = out.transpose(1, 2).reshape(batch_size, -1, self.dim_attn)
+        if pos_bias is not None:
+            attn_bias += pos_bias
+        if mask is not None:
+            if mask.ndim not in {2, 3}:
+                raise ValueError(
+                    f"mask must be 2-D or 3-D; got shape {tuple(mask.shape)}."
+                )
+            mask = (
+                mask.view(batch_size, 1, 1, -1) if mask.ndim == 2 else mask.unsqueeze(1)
+            )
+            attn_bias.masked_fill_(
+                mask == 0,
+                torch.finfo(x.dtype).min,
+            )
+
+        attn = torch.einsum("binc,bjnc->bnij", q, k) + attn_bias
+        attn = F.softmax(attn.float(), dim=-1).type_as(attn)
+        out = torch.einsum("bnij,bjnc->binc", attn, v)
+        out = out.reshape(batch_size, -1, self.dim_attn)
         return self.dropout(self.o(out))
 
 

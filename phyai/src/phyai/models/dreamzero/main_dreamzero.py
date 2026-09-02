@@ -35,6 +35,9 @@ class DreamZeroArgs(EntryArgs):
     image_graph_batch_size: int = 1
     sequential_cpu_offload: bool = False
     skip_parameter_init: bool = False
+    num_inference_steps: int | None = None
+    dynamic_dit: bool = False
+    dynamic_dit_scheduler_steps: int = 16
 
 
 @Engine.register
@@ -51,10 +54,16 @@ class DreamZeroEntry(Entry):
 
     def __init__(self) -> None:
         self.bundle: DreamZeroPipelineBundle | None = None
+        self.num_inference_steps: int | None = None
+        self.dynamic_dit = False
+        self.dynamic_dit_scheduler_steps = 16
 
     def setup(self, args: DreamZeroArgs) -> None:  # type: ignore[override]
         if args.checkpoint_dir is None:
             raise ValueError("DreamZeroArgs.checkpoint_dir is required.")
+        self.num_inference_steps = args.num_inference_steps
+        self.dynamic_dit = args.dynamic_dit
+        self.dynamic_dit_scheduler_steps = args.dynamic_dit_scheduler_steps
         eng = get_engine_config()
         self.bundle = build_dreamzero_minimal_pipeline(
             DreamZeroBuildOptions(
@@ -80,10 +89,18 @@ class DreamZeroEntry(Entry):
         if self.bundle is None:
             raise RuntimeError("DreamZeroEntry.step called before setup.")
         with torch.inference_mode():
-            return self.bundle.pipeline(request)
+            return self.bundle.pipeline(
+                request,
+                num_inference_steps=self.num_inference_steps,
+                dynamic_dit=self.dynamic_dit,
+                dynamic_dit_scheduler_steps=self.dynamic_dit_scheduler_steps,
+            )
 
     def close(self) -> None:
         self.bundle = None
+        self.num_inference_steps = None
+        self.dynamic_dit = False
+        self.dynamic_dit_scheduler_steps = 16
 
     def dump_targets(self) -> dict[str, torch.nn.Module]:  # type: ignore[override]
         if self.bundle is None:

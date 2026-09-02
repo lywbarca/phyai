@@ -8,9 +8,11 @@ context KV prefill, and runs the flow denoise loop through the runner.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 
 import phyai.parallel as P
@@ -25,6 +27,26 @@ from phyai.runtime.schedule import Scheduler
 
 
 _SEQ_LEN_UNSET = object()
+
+
+def _step_trace_tensor(name: str, value: object) -> None:
+    trace_dir = os.getenv("DREAMZERO_STEP_TRACE_DIR")
+    if not trace_dir or not torch.is_tensor(value):
+        return
+    os.makedirs(trace_dir, exist_ok=True)
+    torch.save(value.detach().cpu(), os.path.join(trace_dir, f"{name}.pt"))
+
+
+def _step_trace_meta(name: str, mapping: dict[str, object]) -> None:
+    trace_dir = os.getenv("DREAMZERO_STEP_TRACE_DIR")
+    if not trace_dir:
+        return
+    os.makedirs(trace_dir, exist_ok=True)
+    payload = {
+        key: value.detach().cpu() if torch.is_tensor(value) else value
+        for key, value in mapping.items()
+    }
+    torch.save(payload, os.path.join(trace_dir, f"{name}.pt"))
 
 
 def _axis_rank_size(axis: str) -> tuple[int, int]:
@@ -55,19 +77,23 @@ class DreamZeroRequest:
     clip_feature: torch.Tensor | None = None
     y: torch.Tensor | None = None
     clean_video: torch.Tensor | None = None
+    reference_video: torch.Tensor | None = None
     uncond_context: torch.Tensor | None = None
     uncond_clip_feature: torch.Tensor | None = None
     seq_len: int | None = None
-    current_start_frame: int = 0
+    current_start_frame: int | None = None
     concat_first_frame_latent: bool = False
     image_context_tokens: int = 257
     num_inference_steps: int | None = None
+    dynamic_dit: bool = False
+    dynamic_dit_scheduler_steps: int = 16
     guidance_scale: float | None = None
     sigma_shift: float | None = None
     decouple_inference_noise: bool | None = None
     video_inference_final_noise: float | None = None
     update_kv_cache: bool = False
     prefill_clean_cache: bool | None = None
+    reset_kv_cache: bool | None = None
 
 
 @dataclass
@@ -78,6 +104,9 @@ class DreamZeroSchedulerOutput:
     last_action_pred: torch.Tensor | None
     cond_kv_cache: list[torch.Tensor | None]
     uncond_kv_cache: list[torch.Tensor | None] | None
+    current_start_frame: int = 0
+    dit_compute_steps: int = 0
+    scheduler_steps: int = 0
 
 
 class DreamZeroFlowStepper:
@@ -117,6 +146,10 @@ class DreamZeroFlowStepper:
         self.lower_order_nums = 0
         self.last_sample: torch.Tensor | None = None
         self.this_order = 1
+        self.predict_x0 = True
+        self.solver_p = None
+        self._compiled_uni_p_update = None
+        self._compiled_uni_c_update = None
         self.config = SimpleNamespace(
             num_train_timesteps=self.num_train_timesteps,
             solver_order=self.solver_order,
@@ -141,21 +174,31 @@ class DreamZeroFlowStepper:
             raise ValueError(
                 f"num_inference_steps must be positive, got {num_inference_steps}."
             )
-        sigmas = torch.linspace(
+        sigmas = np.linspace(
             self.sigma_max,
             self.sigma_min,
             num_inference_steps + 1,
-            dtype=torch.float32,
-        )[:-1]
+        ).copy()[:-1]
         sigma_shift = self.shift if shift is None else float(shift)
         sigmas = sigma_shift * sigmas / (1 + (sigma_shift - 1) * sigmas)
-        sigmas = torch.cat([sigmas, sigmas.new_zeros(1)], dim=0)
+        timesteps = sigmas * self.num_train_timesteps
+        sigmas = np.concatenate([sigmas, [0.0]]).astype(np.float32)
+        sigmas_tensor = torch.from_numpy(sigmas).to(device=device)
         if final_sigma:
-            sigma_max = sigmas[0]
-            sigmas = sigmas * (sigma_max - final_sigma) / sigma_max + final_sigma
+            sigma_max = sigmas_tensor[0]
+            sigmas_tensor = (
+                sigmas_tensor * (sigma_max - final_sigma) / sigma_max + final_sigma
+            )
         del dtype
-        self.sigmas = sigmas.to(device=device)
-        self.timesteps = (self.sigmas[:-1] * self.num_train_timesteps).to(torch.int64)
+        self.sigmas = sigmas_tensor
+        if final_sigma:
+            self.timesteps = (self.sigmas[:-1] * self.num_train_timesteps).to(
+                torch.int64
+            )
+        else:
+            self.timesteps = torch.from_numpy(timesteps).to(
+                device=device, dtype=torch.int64
+            )
         self.model_outputs = [None] * self.solver_order
         self.timestep_list = [None] * self.solver_order
         self.lower_order_nums = 0
@@ -177,77 +220,104 @@ class DreamZeroFlowStepper:
     ) -> torch.Tensor:
         if self.sigmas is None:
             raise RuntimeError("call set_timesteps() before step().")
-        sigma_t = self.sigmas[step_index].to(device=sample.device, dtype=sample.dtype)
+        sigma_t = self.sigmas[step_index]
         return sample - sigma_t * model_output
 
     def _multistep_uni_p_bh_update(
         self,
         *,
+        model_output: torch.Tensor,
         sample: torch.Tensor,
         order: int,
         step_index: int,
     ) -> torch.Tensor:
         if self.sigmas is None:
             raise RuntimeError("call set_timesteps() before step().")
-        model_outputs = self.model_outputs
-        m0 = model_outputs[-1]
+        model_output_list = self.model_outputs
+        m0 = model_output_list[-1]
         if m0 is None:
             raise RuntimeError("missing current model output for UniPC update.")
+        x = sample
 
-        sigma_t = self.sigmas[step_index + 1].to(device=sample.device)
-        sigma_s0 = self.sigmas[step_index].to(device=sample.device)
+        if self.solver_p:
+            x_t = self.solver_p.step(
+                model_output, self.timestep_list[-1], x
+            ).prev_sample
+            return x_t
+
+        sigma_t, sigma_s0 = self.sigmas[step_index + 1], self.sigmas[step_index]
         alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma_t)
-        _alpha_s0, sigma_s0 = self._sigma_to_alpha_sigma_t(sigma_s0)
+        alpha_s0, sigma_s0 = self._sigma_to_alpha_sigma_t(sigma_s0)
 
         lambda_t = torch.log(alpha_t) - torch.log(sigma_t)
-        lambda_s0 = torch.log(_alpha_s0) - torch.log(sigma_s0)
+        lambda_s0 = torch.log(alpha_s0) - torch.log(sigma_s0)
         h = lambda_t - lambda_s0
 
         rks = []
-        d1s = []
+        D1s = []
         for i in range(1, order):
             si = step_index - i
-            mi = model_outputs[-(i + 1)]
-            if mi is None:
-                continue
-            alpha_si, sigma_si = self._sigma_to_alpha_sigma_t(
-                self.sigmas[si].to(device=sample.device)
-            )
+            mi = model_output_list[-(i + 1)]
+            alpha_si, sigma_si = self._sigma_to_alpha_sigma_t(self.sigmas[si])
             lambda_si = torch.log(alpha_si) - torch.log(sigma_si)
             rk = (lambda_si - lambda_s0) / h
             rks.append(rk)
-            d1s.append((mi - m0) / rk.to(device=m0.device, dtype=m0.dtype))
+            D1s.append((mi - m0) / rk)
 
-        hh = -h
+        rks.append(torch.ones((), dtype=self.sigmas.dtype, device=self.sigmas.device))
+        rks = torch.stack(rks, dim=0)
+
+        R = []
+        b = []
+
+        hh = -h if self.predict_x0 else h
         h_phi_1 = torch.expm1(hh)
-        b_h = torch.expm1(hh)
+        h_phi_k = h_phi_1 / hh - 1
 
-        x_t = sigma_t / sigma_s0 * sample - alpha_t * h_phi_1 * m0
-        if d1s:
-            d1s_tensor = torch.stack(d1s, dim=1)
+        factorial_i = 1
+
+        if self.config.solver_type == "bh1":
+            B_h = hh
+        elif self.config.solver_type == "bh2":
+            B_h = torch.expm1(hh)
+        else:
+            raise NotImplementedError
+
+        for i in range(1, order + 1):
+            R.append(torch.pow(rks, i - 1))
+            b.append(h_phi_k * factorial_i / B_h)
+            factorial_i *= i + 1
+            h_phi_k = h_phi_k / hh - 1 / factorial_i
+
+        R = torch.stack(R, dim=0)
+        b = torch.stack(b, dim=0)
+
+        if len(D1s) > 0:
+            D1s = torch.stack(D1s, dim=1)
             if order == 2:
-                rhos_p = torch.full((1,), 0.5, dtype=sample.dtype, device=sample.device)
+                rhos_p = torch.full((1,), 0.5, dtype=x.dtype, device=self.sigmas.device)
             else:
-                rks.append(
-                    torch.ones((), dtype=self.sigmas.dtype, device=sample.device)
-                )
-                rks_tensor = torch.stack(rks, dim=0)
-                r_mat = []
-                b_vec = []
-                h_phi_k = h_phi_1 / hh - 1
-                factorial_i = 1
-                for i in range(1, order + 1):
-                    r_mat.append(torch.pow(rks_tensor, i - 1))
-                    b_vec.append(h_phi_k * factorial_i / b_h)
-                    factorial_i *= i + 1
-                    h_phi_k = h_phi_k / hh - 1 / factorial_i
-                rhos_p = torch.linalg.solve_ex(
-                    torch.stack(r_mat, dim=0)[:-1, :-1],
-                    torch.stack(b_vec, dim=0)[:-1],
-                )[0].to(device=sample.device, dtype=sample.dtype)
-            pred_res = torch.einsum("k,bkc...->bc...", rhos_p, d1s_tensor)
-            x_t = x_t - alpha_t * b_h * pred_res
-        return x_t.to(sample.dtype)
+                rhos_p = torch.linalg.solve_ex(R[:-1, :-1], b[:-1])[0].to(x.dtype)
+        else:
+            D1s = None
+            rhos_p = None
+
+        if self.predict_x0:
+            x_t_ = sigma_t / sigma_s0 * x - alpha_t * h_phi_1 * m0
+            if D1s is not None:
+                pred_res = torch.einsum("k,bkc...->bc...", rhos_p, D1s)
+            else:
+                pred_res = 0
+            x_t = x_t_ - alpha_t * B_h * pred_res
+        else:
+            x_t_ = alpha_t / alpha_s0 * x - sigma_t * h_phi_1 * m0
+            if D1s is not None:
+                pred_res = torch.einsum("k,bkc...->bc...", rhos_p, D1s)
+            else:
+                pred_res = 0
+            x_t = x_t_ - sigma_t * B_h * pred_res
+
+        return x_t.to(x.dtype)
 
     def _multistep_uni_c_bh_update(
         self,
@@ -260,13 +330,15 @@ class DreamZeroFlowStepper:
     ) -> torch.Tensor:
         if self.sigmas is None:
             raise RuntimeError("call set_timesteps() before step().")
-        model_outputs = self.model_outputs
-        m0 = model_outputs[-1]
+        model_output_list = self.model_outputs
+        m0 = model_output_list[-1]
         if m0 is None:
             raise RuntimeError("missing previous model output for UniPC correction.")
+        x = last_sample
+        x_t = this_sample
+        model_t = this_model_output
 
-        sigma_t = self.sigmas[step_index].to(device=this_sample.device)
-        sigma_s0 = self.sigmas[step_index - 1].to(device=this_sample.device)
+        sigma_t, sigma_s0 = self.sigmas[step_index], self.sigmas[step_index - 1]
         alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma_t)
         alpha_s0, sigma_s0 = self._sigma_to_alpha_sigma_t(sigma_s0)
 
@@ -275,58 +347,70 @@ class DreamZeroFlowStepper:
         h = lambda_t - lambda_s0
 
         rks = []
-        d1s = []
+        D1s = []
         for i in range(1, order):
             si = step_index - (i + 1)
-            mi = model_outputs[-(i + 1)]
-            if mi is None:
-                continue
-            alpha_si, sigma_si = self._sigma_to_alpha_sigma_t(
-                self.sigmas[si].to(device=this_sample.device)
-            )
+            mi = model_output_list[-(i + 1)]
+            alpha_si, sigma_si = self._sigma_to_alpha_sigma_t(self.sigmas[si])
             lambda_si = torch.log(alpha_si) - torch.log(sigma_si)
             rk = (lambda_si - lambda_s0) / h
             rks.append(rk)
-            d1s.append((mi - m0) / rk.to(device=m0.device, dtype=m0.dtype))
-        rks.append(torch.ones((), dtype=self.sigmas.dtype, device=this_sample.device))
-        rks_tensor = torch.stack(rks, dim=0)
+            D1s.append((mi - m0) / rk)
+        rks.append(torch.ones((), dtype=self.sigmas.dtype, device=self.sigmas.device))
+        rks = torch.stack(rks, dim=0)
 
-        hh = -h
+        R = []
+        b = []
+
+        hh = -h if self.predict_x0 else h
         h_phi_1 = torch.expm1(hh)
         h_phi_k = h_phi_1 / hh - 1
-        b_h = torch.expm1(hh)
 
-        r_mat = []
-        b_vec = []
         factorial_i = 1
+
+        if self.config.solver_type == "bh1":
+            B_h = hh
+        elif self.config.solver_type == "bh2":
+            B_h = torch.expm1(hh)
+        else:
+            raise NotImplementedError
+
         for i in range(1, order + 1):
-            r_mat.append(torch.pow(rks_tensor, i - 1))
-            b_vec.append(h_phi_k * factorial_i / b_h)
+            R.append(torch.pow(rks, i - 1))
+            b.append(h_phi_k * factorial_i / B_h)
             factorial_i *= i + 1
             h_phi_k = h_phi_k / hh - 1 / factorial_i
 
-        if order == 1:
-            rhos_c = torch.full(
-                (1,),
-                0.5,
-                dtype=this_sample.dtype,
-                device=this_sample.device,
-            )
-        else:
-            rhos_c = torch.linalg.solve_ex(
-                torch.stack(r_mat, dim=0),
-                torch.stack(b_vec, dim=0),
-            )[0].to(device=this_sample.device, dtype=this_sample.dtype)
+        R = torch.stack(R, dim=0)
+        b = torch.stack(b, dim=0)
 
-        x_t = sigma_t / sigma_s0 * last_sample - alpha_t * h_phi_1 * m0
-        if d1s:
-            d1s_tensor = torch.stack(d1s, dim=1)
-            corr_res = torch.einsum("k,bkc...->bc...", rhos_c[:-1], d1s_tensor)
+        if len(D1s) > 0:
+            D1s = torch.stack(D1s, dim=1)
         else:
-            corr_res = 0
-        d1_t = this_model_output - m0
-        x_t = x_t - alpha_t * b_h * (corr_res + rhos_c[-1] * d1_t)
-        return x_t.to(this_sample.dtype)
+            D1s = None
+
+        if order == 1:
+            rhos_c = torch.full((1,), 0.5, dtype=x.dtype, device=self.sigmas.device)
+        else:
+            rhos_c = torch.linalg.solve_ex(R, b)[0].to(x.dtype)
+
+        if self.predict_x0:
+            x_t_ = sigma_t / sigma_s0 * x - alpha_t * h_phi_1 * m0
+            if D1s is not None:
+                corr_res = torch.einsum("k,bkc...->bc...", rhos_c[:-1], D1s)
+            else:
+                corr_res = 0
+            D1_t = model_t - m0
+            x_t = x_t_ - alpha_t * B_h * (corr_res + rhos_c[-1] * D1_t)
+        else:
+            x_t_ = alpha_t / alpha_s0 * x - sigma_t * h_phi_1 * m0
+            if D1s is not None:
+                corr_res = torch.einsum("k,bkc...->bc...", rhos_c[:-1], D1s)
+            else:
+                corr_res = 0
+            D1_t = model_t - m0
+            x_t = x_t_ - sigma_t * B_h * (corr_res + rhos_c[-1] * D1_t)
+        return x_t.to(x.dtype)
 
     def step(
         self,
@@ -346,7 +430,22 @@ class DreamZeroFlowStepper:
             step_index=step_index,
         )
         if use_corrector:
-            sample = self._multistep_uni_c_bh_update(
+            if sample.is_cuda and self._compiled_uni_c_update is None:
+                torch._dynamo.config.recompile_limit = max(
+                    torch._dynamo.config.recompile_limit, 800
+                )
+                self._compiled_uni_c_update = torch.compile(
+                    self._multistep_uni_c_bh_update,
+                    mode="reduce-overhead",
+                    fullgraph=True,
+                    dynamic=False,
+                )
+            uni_c_update = (
+                self._compiled_uni_c_update
+                if sample.is_cuda
+                else self._multistep_uni_c_bh_update
+            )
+            sample = uni_c_update(
                 this_model_output=converted,
                 last_sample=self.last_sample,
                 this_sample=sample,
@@ -371,7 +470,23 @@ class DreamZeroFlowStepper:
             raise RuntimeError("UniPC order must be positive.")
 
         self.last_sample = sample
-        prev_sample = self._multistep_uni_p_bh_update(
+        if sample.is_cuda and self._compiled_uni_p_update is None:
+            torch._dynamo.config.recompile_limit = max(
+                torch._dynamo.config.recompile_limit, 800
+            )
+            self._compiled_uni_p_update = torch.compile(
+                self._multistep_uni_p_bh_update,
+                mode="reduce-overhead",
+                fullgraph=True,
+                dynamic=False,
+            )
+        uni_p_update = (
+            self._compiled_uni_p_update
+            if sample.is_cuda
+            else self._multistep_uni_p_bh_update
+        )
+        prev_sample = uni_p_update(
+            model_output=model_output,
             sample=sample,
             order=self.this_order,
             step_index=step_index,
@@ -397,13 +512,24 @@ class DreamZeroWS1Scheduler(Scheduler):
             device = next(model.parameters()).device
         self.device = torch.device(device)
         self.cfg_rank, self.cfg_size = _axis_rank_size("cfg")
-        self.cond_runner = DreamZeroDiTRunner(model, device=self.device)
+        max_kv_cache_tokens = self._max_kv_cache_tokens(model)
+        self.cond_runner = DreamZeroDiTRunner(
+            model,
+            device=self.device,
+            max_kv_cache_tokens=max_kv_cache_tokens,
+        )
         self.uncond_runner = (
-            DreamZeroDiTRunner(model, device=self.device)
+            DreamZeroDiTRunner(
+                model,
+                device=self.device,
+                max_kv_cache_tokens=max_kv_cache_tokens,
+            )
             if use_cfg_runner or self.cfg_size > 1
             else None
         )
+        self.current_start_frame = 0
         self._ready = False
+        self._detail_trace_complete = False
 
     def setup(self) -> None:
         self.cond_runner.setup()
@@ -415,6 +541,88 @@ class DreamZeroWS1Scheduler(Scheduler):
         self.cond_runner.reset()
         if self.uncond_runner is not None:
             self.uncond_runner.reset()
+
+    def reset_sequence(self) -> None:
+        self._reset_runners()
+        self.current_start_frame = 0
+
+    @staticmethod
+    def _max_kv_cache_tokens(model: DreamZeroDiT) -> int | None:
+        if not hasattr(model, "blocks") or not model.blocks:
+            return None
+        first_attn = model.blocks[0].self_attn
+        max_attention_size = int(getattr(first_attn, "max_attention_size", -1))
+        return max_attention_size if max_attention_size > 0 else None
+
+    def _local_attn_size(self) -> int:
+        if not hasattr(self.model, "blocks"):
+            return -1
+        first_attn = self.model.blocks[0].self_attn
+        return int(getattr(first_attn, "local_attn_size", -1))
+
+    @property
+    def local_attn_size(self) -> int:
+        return self._local_attn_size()
+
+    @staticmethod
+    def _should_run_dynamic_dit(
+        previous_video_predictions: list[torch.Tensor],
+        skip_countdown: int,
+        step_index: int | None = None,
+    ) -> tuple[bool, int]:
+        """Match DreamZero's cosine-similarity dynamic DiT schedule."""
+        trace = os.getenv("DREAMZERO_DYNAMIC_DIT_TRACE", "").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        if len(previous_video_predictions) < 2:
+            if trace:
+                print(
+                    f"DYNAMIC_DIT_DECISION step={step_index} action=run reason=history",
+                    flush=True,
+                )
+            return True, skip_countdown
+        if skip_countdown > 1:
+            if trace:
+                print(
+                    "DYNAMIC_DIT_DECISION "
+                    f"step={step_index} action=skip reason=countdown "
+                    f"countdown={skip_countdown}",
+                    flush=True,
+                )
+            return False, skip_countdown - 1
+        if skip_countdown == 1:
+            if trace:
+                print(
+                    "DYNAMIC_DIT_DECISION "
+                    f"step={step_index} action=run reason=countdown_complete",
+                    flush=True,
+                )
+            return True, 0
+
+        last = previous_video_predictions[-1].flatten(1).float()
+        previous = previous_video_predictions[-2].flatten(1).float()
+        similarity = torch.nn.functional.cosine_similarity(last, previous, dim=1).mean()
+        for threshold, countdown in ((0.95, 4), (0.93, 2)):
+            if similarity > threshold:
+                if trace:
+                    print(
+                        "DYNAMIC_DIT_DECISION "
+                        f"step={step_index} action=skip reason=similarity "
+                        f"similarity={similarity.item():.9f} "
+                        f"threshold={threshold:.9f} countdown={countdown}",
+                        flush=True,
+                    )
+                return False, countdown
+        if trace:
+            print(
+                "DYNAMIC_DIT_DECISION "
+                f"step={step_index} action=run reason=similarity "
+                f"similarity={similarity.item():.9f} threshold=0.930000000",
+                flush=True,
+            )
+        return True, 0
 
     def _run_runner(
         self,
@@ -547,34 +755,121 @@ class DreamZeroWS1Scheduler(Scheduler):
             dtype=torch.int64,
             device=request.clean_video.device,
         )
-        self._run_runner(
-            runner,
-            video=request.clean_video,
-            timestep=timestep,
-            action=None,
-            timestep_action=None,
-            state=None,
-            embodiment_id=None,
-            context=context,
-            clip_feature=clip_feature,
-            y=self._slice_temporal_condition(
-                request.y,
-                start=0,
-                length=request.clean_video.shape[2],
-            ),
-            request=request,
-            update_kv_cache=True,
-            use_crossattn_cache=False,
-            update_crossattn_cache=True,
-            seq_len=None,
-            current_start_frame=0,
+        trace_warmup = (
+            os.getenv("DREAMZERO_DIT_DETAIL_TRACE_DIR") is not None
+            and os.getenv("DREAMZERO_DIT_TRACE_WARMUP", "0").lower() in {"1", "true"}
+            and runner is self.cond_runner
         )
+        if trace_warmup:
+            self.model._dz_trace_enabled = True
+            self.model._dz_trace_label = "first-frame_KV_warmup"
+            self.model._dz_trace_branch = 0
+        try:
+            self._run_runner(
+                runner,
+                video=request.clean_video,
+                timestep=timestep,
+                action=None,
+                timestep_action=None,
+                state=None,
+                embodiment_id=None,
+                context=context,
+                clip_feature=clip_feature,
+                y=self._slice_temporal_condition(
+                    request.y,
+                    start=0,
+                    length=request.clean_video.shape[2],
+                ),
+                request=request,
+                update_kv_cache=True,
+                use_crossattn_cache=False,
+                update_crossattn_cache=True,
+                seq_len=None,
+                current_start_frame=0,
+            )
+        finally:
+            if trace_warmup:
+                self.model._dz_trace_enabled = False
+
+    def _update_reference_cache(
+        self,
+        runner: DreamZeroDiTRunner,
+        *,
+        request: DreamZeroRequest,
+        reference_video: torch.Tensor,
+        context: torch.Tensor,
+        clip_feature: torch.Tensor | None,
+        current_start_frame: int,
+    ) -> None:
+        bsz = reference_video.shape[0]
+        num_frames = reference_video.shape[2]
+        timestep = torch.zeros(
+            bsz,
+            num_frames,
+            dtype=torch.int64,
+            device=reference_video.device,
+        )
+        reference_start_frame = max(0, current_start_frame - num_frames)
+        trace_reference = (
+            os.getenv("DREAMZERO_DIT_TRACE_REFERENCE", "0").lower()
+            in {"1", "true", "yes"}
+            and runner is self.cond_runner
+        )
+        if trace_reference:
+            self.model._dz_trace_enabled = True
+            self.model._dz_trace_label = "reference_KV_update"
+            self.model._dz_trace_branch = 0
+        try:
+            self._run_runner(
+                runner,
+                video=reference_video,
+                timestep=timestep,
+                action=None,
+                timestep_action=None,
+                state=None,
+                embodiment_id=None,
+                context=context,
+                clip_feature=clip_feature,
+                y=self._slice_temporal_condition(
+                    request.y,
+                    start=reference_start_frame,
+                    length=num_frames,
+                ),
+                request=request,
+                update_kv_cache=True,
+                use_crossattn_cache=True,
+                update_crossattn_cache=False,
+                seq_len=None,
+                current_start_frame=reference_start_frame,
+            )
+        finally:
+            if trace_reference:
+                self.model._dz_trace_enabled = False
 
     @torch.no_grad()
     def step(self, request: DreamZeroRequest) -> DreamZeroSchedulerOutput:
         if not self._ready:
             raise RuntimeError("call setup() before step().")
-        self._reset_runners()
+
+        requested_start_frame = (
+            self.current_start_frame
+            if request.current_start_frame is None
+            else int(request.current_start_frame)
+        )
+        local_attn_size = self._local_attn_size()
+        reset_kv_cache = (
+            requested_start_frame == 0
+            if request.reset_kv_cache is None
+            else bool(request.reset_kv_cache)
+        )
+        if local_attn_size != -1 and requested_start_frame >= local_attn_size:
+            reset_kv_cache = True
+            requested_start_frame = 0
+        if reset_kv_cache:
+            self.reset_sequence()
+            requested_start_frame = 0
+        else:
+            self.current_start_frame = requested_start_frame
 
         video = request.video.to(self.device)
         action = request.action.to(self.device)
@@ -591,17 +886,21 @@ class DreamZeroWS1Scheduler(Scheduler):
             else None
         )
         y = request.y.to(self.device) if request.y is not None else None
-        denoise_y = self._slice_temporal_condition(
-            y,
-            start=request.current_start_frame,
-            length=video.shape[2],
-        )
         clean_video = (
             request.clean_video.to(self.device)
             if request.clean_video is not None
             else None
         )
-        if clean_video is not request.clean_video:
+        reference_video = (
+            request.reference_video.to(self.device)
+            if request.reference_video is not None
+            else None
+        )
+        if (
+            clean_video is not request.clean_video
+            or reference_video is not request.reference_video
+            or request.current_start_frame != requested_start_frame
+        ):
             request = DreamZeroRequest(
                 video=video,
                 action=action,
@@ -611,19 +910,23 @@ class DreamZeroWS1Scheduler(Scheduler):
                 clip_feature=clip_feature,
                 y=y,
                 clean_video=clean_video,
+                reference_video=reference_video,
                 uncond_context=request.uncond_context,
                 uncond_clip_feature=request.uncond_clip_feature,
                 seq_len=request.seq_len,
-                current_start_frame=request.current_start_frame,
+                current_start_frame=requested_start_frame,
                 concat_first_frame_latent=request.concat_first_frame_latent,
                 image_context_tokens=request.image_context_tokens,
                 num_inference_steps=request.num_inference_steps,
+                dynamic_dit=request.dynamic_dit,
+                dynamic_dit_scheduler_steps=request.dynamic_dit_scheduler_steps,
                 guidance_scale=request.guidance_scale,
                 sigma_shift=request.sigma_shift,
                 decouple_inference_noise=request.decouple_inference_noise,
                 video_inference_final_noise=request.video_inference_final_noise,
                 update_kv_cache=request.update_kv_cache,
                 prefill_clean_cache=request.prefill_clean_cache,
+                reset_kv_cache=request.reset_kv_cache,
             )
 
         guidance_scale = (
@@ -643,7 +946,7 @@ class DreamZeroWS1Scheduler(Scheduler):
         )
 
         prefill_clean_cache = (
-            request.current_start_frame == 0 and request.clean_video is not None
+            requested_start_frame == 0 and request.clean_video is not None
             if request.prefill_clean_cache is None
             else bool(request.prefill_clean_cache)
         )
@@ -676,8 +979,61 @@ class DreamZeroWS1Scheduler(Scheduler):
                     context=uncond_context,
                     clip_feature=uncond_clip,
                 )
+            if requested_start_frame == 0:
+                requested_start_frame = int(request.clean_video.shape[2])
+                self.current_start_frame = requested_start_frame
 
-        steps = request.num_inference_steps or self.cfg.num_inference_timesteps
+        if reference_video is not None and requested_start_frame != 1:
+            if cfg_parallel:
+                self._update_reference_cache(
+                    branch_runner,
+                    request=request,
+                    reference_video=reference_video,
+                    context=branch_context,
+                    clip_feature=branch_clip,
+                    current_start_frame=requested_start_frame,
+                )
+            else:
+                self._update_reference_cache(
+                    self.cond_runner,
+                    request=request,
+                    reference_video=reference_video,
+                    context=context,
+                    clip_feature=clip_feature,
+                    current_start_frame=requested_start_frame,
+                )
+            if use_cfg and not cfg_parallel:
+                assert self.uncond_runner is not None
+                uncond_context = request.uncond_context.to(self.device)
+                uncond_clip = (
+                    request.uncond_clip_feature.to(self.device)
+                    if request.uncond_clip_feature is not None
+                    else None
+                )
+                self._update_reference_cache(
+                    self.uncond_runner,
+                    request=request,
+                    reference_video=reference_video,
+                    context=uncond_context,
+                    clip_feature=uncond_clip,
+                    current_start_frame=requested_start_frame,
+                )
+
+        denoise_y = self._slice_temporal_condition(
+            y,
+            start=requested_start_frame,
+            length=video.shape[2],
+        )
+
+        steps = (
+            request.dynamic_dit_scheduler_steps
+            if request.dynamic_dit
+            else request.num_inference_steps or self.cfg.num_inference_timesteps
+        )
+        if request.dynamic_dit and steps < 2:
+            raise ValueError(
+                f"dynamic_dit_scheduler_steps must be at least 2, got {steps}."
+            )
         sigma_shift = request.sigma_shift or self.cfg.sigma_shift
         video_stepper = DreamZeroFlowStepper(shift=sigma_shift)
         action_stepper = DreamZeroFlowStepper(shift=sigma_shift)
@@ -705,6 +1061,9 @@ class DreamZeroWS1Scheduler(Scheduler):
 
         last_video_pred: torch.Tensor | None = None
         last_action_pred: torch.Tensor | None = None
+        previous_video_predictions: list[torch.Tensor] = []
+        skip_countdown = 0
+        dit_compute_steps = 0
         for step_index, video_timestep in enumerate(video_stepper.timesteps):
             action_timestep = action_stepper.timesteps[step_index]
             timestep = torch.full(
@@ -719,7 +1078,21 @@ class DreamZeroWS1Scheduler(Scheduler):
                 dtype=torch.int64,
                 device=self.device,
             )
-            if cfg_parallel:
+            should_run_dit = True
+            if request.dynamic_dit:
+                should_run_dit, skip_countdown = self._should_run_dynamic_dit(
+                    previous_video_predictions,
+                    skip_countdown,
+                    step_index,
+                )
+            if not should_run_dit:
+                if last_video_pred is None or last_action_pred is None:
+                    raise RuntimeError(
+                        "dynamic DiT skipped before a prediction was available."
+                    )
+                video_pred = last_video_pred
+                action_pred = last_action_pred
+            elif cfg_parallel:
                 local = self._run_runner(
                     branch_runner,
                     video=video,
@@ -735,6 +1108,7 @@ class DreamZeroWS1Scheduler(Scheduler):
                     update_kv_cache=request.update_kv_cache,
                     use_crossattn_cache=True,
                     update_crossattn_cache=step_index == 0,
+                    current_start_frame=requested_start_frame,
                 )
                 if local.action is None:
                     raise RuntimeError(
@@ -749,30 +1123,46 @@ class DreamZeroWS1Scheduler(Scheduler):
                 else:
                     video_pred = local.video
                     action_pred = local.action
-            else:
-                cond = self._run_runner(
-                    self.cond_runner,
-                    video=video,
-                    timestep=timestep,
-                    action=action,
-                    timestep_action=timestep_action,
-                    state=state,
-                    embodiment_id=embodiment_id,
-                    context=context,
-                    clip_feature=clip_feature,
-                    y=denoise_y,
-                    request=request,
-                    update_kv_cache=request.update_kv_cache,
-                    use_crossattn_cache=True,
-                    update_crossattn_cache=step_index == 0,
+            elif should_run_dit:
+                trace_detail = (
+                    os.getenv("DREAMZERO_DIT_DETAIL_TRACE_DIR") is not None
+                    and not self._detail_trace_complete
+                    and step_index == 0
+                    and not request.update_kv_cache
                 )
+                if trace_detail:
+                    self.model._dz_trace_enabled = True
+                    self.model._dz_trace_label = "DiT_step_00"
+                    self.model._dz_trace_branch = 0
+                try:
+                    cond = self._run_runner(
+                        self.cond_runner,
+                        video=video,
+                        timestep=timestep,
+                        action=action,
+                        timestep_action=timestep_action,
+                        state=state,
+                        embodiment_id=embodiment_id,
+                        context=context,
+                        clip_feature=clip_feature,
+                        y=denoise_y,
+                        request=request,
+                        update_kv_cache=request.update_kv_cache,
+                        use_crossattn_cache=True,
+                        update_crossattn_cache=step_index == 0,
+                        current_start_frame=requested_start_frame,
+                    )
+                finally:
+                    if trace_detail:
+                        self.model._dz_trace_enabled = False
+                        self._detail_trace_complete = True
                 if cond.action is None:
                     raise RuntimeError(
                         "DreamZero action denoise forward returned None."
                     )
                 video_pred = cond.video
                 action_pred = cond.action
-            if use_cfg and not cfg_parallel:
+            if should_run_dit and use_cfg and not cfg_parallel:
                 assert self.uncond_runner is not None
                 uncond_context = request.uncond_context.to(self.device)
                 uncond_clip = (
@@ -780,26 +1170,107 @@ class DreamZeroWS1Scheduler(Scheduler):
                     if request.uncond_clip_feature is not None
                     else None
                 )
-                uncond = self._run_runner(
-                    self.uncond_runner,
-                    video=video,
-                    timestep=timestep,
-                    action=action,
-                    timestep_action=timestep_action,
-                    state=state,
-                    embodiment_id=embodiment_id,
-                    context=uncond_context,
-                    clip_feature=uncond_clip,
-                    y=denoise_y,
-                    request=request,
-                    update_kv_cache=request.update_kv_cache,
-                    use_crossattn_cache=True,
-                    update_crossattn_cache=step_index == 0,
-                )
+                trace_uncond = trace_detail and os.getenv(
+                    "DREAMZERO_DIT_TRACE_UNCOND", "0"
+                ).lower() in {"1", "true", "yes"}
+                if trace_uncond:
+                    self.model._dz_trace_enabled = True
+                    self.model._dz_trace_label = "DiT_step_00"
+                    self.model._dz_trace_branch = 1
+                try:
+                    uncond = self._run_runner(
+                        self.uncond_runner,
+                        video=video,
+                        timestep=timestep,
+                        action=action,
+                        timestep_action=timestep_action,
+                        state=state,
+                        embodiment_id=embodiment_id,
+                        context=uncond_context,
+                        clip_feature=uncond_clip,
+                        y=denoise_y,
+                        request=request,
+                        update_kv_cache=request.update_kv_cache,
+                        use_crossattn_cache=True,
+                        update_crossattn_cache=step_index == 0,
+                        current_start_frame=requested_start_frame,
+                    )
+                finally:
+                    if trace_uncond:
+                        self.model._dz_trace_enabled = False
                 if uncond.action is None:
                     raise RuntimeError("DreamZero uncond forward returned no action.")
                 video_pred = uncond.video + guidance_scale * (cond.video - uncond.video)
                 action_pred = cond.action
+            if should_run_dit:
+                if video_pred.is_cuda and os.getenv(
+                    "DREAMZERO_SYNC_DIT_OUTPUTS", "0"
+                ).lower() in {"1", "true", "yes"}:
+                    torch.cuda.synchronize(video_pred.device)
+                if not cfg_parallel:
+                    _step_trace_tensor(
+                        f"step_{step_index:02d}.video_pred_cond",
+                        cond.video,
+                    )
+                    _step_trace_tensor(
+                        f"step_{step_index:02d}.action_pred_cond", cond.action
+                    )
+                    if use_cfg:
+                        _step_trace_tensor(
+                            f"step_{step_index:02d}.video_pred_uncond",
+                            uncond.video,
+                        )
+                        _step_trace_tensor(
+                            f"step_{step_index:02d}.action_pred_uncond",
+                            uncond.action,
+                        )
+                _step_trace_tensor(
+                    f"step_{step_index:02d}.video_pred_cfg_model_order",
+                    video_pred,
+                )
+                _step_trace_tensor(
+                    f"step_{step_index:02d}.video_pred_cfg",
+                    video_pred.transpose(1, 2),
+                )
+                _step_trace_tensor(
+                    f"step_{step_index:02d}.action_pred_cfg", action_pred
+                )
+                _step_trace_meta(
+                    f"step_{step_index:02d}.prediction_meta",
+                    {
+                        "step_index": step_index,
+                        "video_timestep": video_timestep,
+                        "action_timestep": action_timestep,
+                        "used_cached_prediction": False,
+                        "num_prediction_branches": 2 if use_cfg else 1,
+                    },
+                )
+                dit_compute_steps += 1
+                previous_video_predictions.append(video_pred)
+                if len(previous_video_predictions) > 2:
+                    previous_video_predictions.pop(0)
+            else:
+                _step_trace_tensor(
+                    f"step_{step_index:02d}.video_pred_cfg_model_order",
+                    video_pred,
+                )
+                _step_trace_tensor(
+                    f"step_{step_index:02d}.video_pred_cfg",
+                    video_pred.transpose(1, 2),
+                )
+                _step_trace_tensor(
+                    f"step_{step_index:02d}.action_pred_cfg", action_pred
+                )
+                _step_trace_meta(
+                    f"step_{step_index:02d}.prediction_meta",
+                    {
+                        "step_index": step_index,
+                        "video_timestep": video_timestep,
+                        "action_timestep": action_timestep,
+                        "used_cached_prediction": True,
+                        "num_prediction_branches": 0,
+                    },
+                )
             if video_pred.shape != video.shape:
                 raise ValueError(
                     "DreamZero video prediction shape must match the denoise "
@@ -810,6 +1281,18 @@ class DreamZeroWS1Scheduler(Scheduler):
                     "channels are stepped."
                 )
 
+            _step_trace_tensor(
+                f"step_{step_index:02d}.video_sample_before",
+                video.transpose(1, 2),
+            )
+            _step_trace_tensor(
+                f"step_{step_index:02d}.video_model_output",
+                video_pred.transpose(1, 2),
+            )
+            _step_trace_tensor(f"step_{step_index:02d}.action_sample_before", action)
+            _step_trace_tensor(
+                f"step_{step_index:02d}.action_model_output", action_pred
+            )
             video = video_stepper.step(
                 model_output=video_pred,
                 sample=video,
@@ -822,8 +1305,23 @@ class DreamZeroWS1Scheduler(Scheduler):
                 step_index=step_index,
                 timestep=action_timestep,
             )
+            _step_trace_tensor(
+                f"step_{step_index:02d}.video_sample_after",
+                video.transpose(1, 2),
+            )
+            _step_trace_tensor(f"step_{step_index:02d}.action_sample_after", action)
+            _step_trace_meta(
+                f"step_{step_index:02d}.scheduler_meta",
+                {
+                    "step_index": step_index,
+                    "video_timestep": video_timestep,
+                    "action_timestep": action_timestep,
+                },
+            )
             last_video_pred = video_pred
             last_action_pred = action_pred
+
+        self.current_start_frame = requested_start_frame + int(video.shape[2])
 
         return DreamZeroSchedulerOutput(
             video=video,
@@ -832,6 +1330,9 @@ class DreamZeroWS1Scheduler(Scheduler):
             last_action_pred=last_action_pred,
             cond_kv_cache=self.cond_runner.kv_cache,
             uncond_kv_cache=self.uncond_runner.kv_cache if use_cfg else None,
+            current_start_frame=self.current_start_frame,
+            dit_compute_steps=dit_compute_steps,
+            scheduler_steps=steps,
         )
 
 

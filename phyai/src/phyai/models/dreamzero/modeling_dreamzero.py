@@ -7,8 +7,10 @@ consume optional cache tensors and return updated tensors.
 
 from __future__ import annotations
 
+import importlib
 import math
 import os
+from collections.abc import Callable
 
 import torch
 import torch.distributed as dist
@@ -32,6 +34,56 @@ _DREAMZERO_DROPPED_PREFIXES = (
     "action_head.image_encoder.",
     "action_head.vae.",
 )
+
+
+def _get_flash_attn_varlen_func() -> Callable[..., torch.Tensor]:
+    try:
+        flash_attn = importlib.import_module("flash_attn")
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "DreamZero TE cross-attention requires FlashAttention 2."
+        ) from exc
+    return flash_attn.flash_attn_varlen_func
+
+
+def _dreamzero_fa2_cross_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> torch.Tensor:
+    """Match the official DreamZero FlashAttention 2 cross-attention call."""
+    batch_size, query_length = query.shape[:2]
+    key_length = key.shape[1]
+    query_flat = query.flatten(0, 1).to(value.dtype)
+    key_flat = key.flatten(0, 1).to(value.dtype)
+    value_flat = value.flatten(0, 1)
+    query_lengths = torch.full(
+        (batch_size,), query_length, dtype=torch.int32, device=query.device
+    )
+    key_lengths = torch.full(
+        (batch_size,), key_length, dtype=torch.int32, device=key.device
+    )
+    cu_seqlens_q = torch.cat([query_lengths.new_zeros(1), query_lengths]).cumsum(
+        0, dtype=torch.int32
+    )
+    cu_seqlens_k = torch.cat([key_lengths.new_zeros(1), key_lengths]).cumsum(
+        0, dtype=torch.int32
+    )
+    output = _get_flash_attn_varlen_func()(
+        q=query_flat,
+        k=key_flat,
+        v=value_flat,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=query_length,
+        max_seqlen_k=key_length,
+        dropout_p=0.0,
+        softmax_scale=None,
+        causal=False,
+        window_size=(-1, -1),
+        deterministic=False,
+    )
+    return output.unflatten(0, (batch_size, query_length)).type(query.dtype)
 
 
 def _dit_detail_trace_blocks() -> set[int]:
@@ -69,7 +121,10 @@ def _dit_detail_save(block: nn.Module, suffix: str, value: torch.Tensor) -> None
     block_index = int(getattr(block, "_dz_trace_block_index", -1))
     save_blocks = _dit_detail_trace_blocks()
     stage_blocks = _dit_detail_trace_stages()
-    if suffix not in {"block_input", "block_output"} and block_index not in stage_blocks:
+    if (
+        suffix not in {"block_input", "block_output"}
+        and block_index not in stage_blocks
+    ):
         return
     if block_index not in save_blocks and block_index not in stage_blocks:
         return
@@ -77,6 +132,23 @@ def _dit_detail_save(block: nn.Module, suffix: str, value: torch.Tensor) -> None
     label = str(getattr(block, "_dz_trace_label", "unknown")).replace(" ", "_")
     branch = int(getattr(block, "_dz_trace_branch", -1))
     filename = f"{label}.branch{branch}.block{block_index:02d}.{suffix}.pt"
+    torch.save(value.detach().cpu(), os.path.join(trace_dir, filename))
+
+
+def _dit_model_detail_save(
+    model: nn.Module, suffix: str, value: torch.Tensor | None
+) -> None:
+    trace_dir = os.getenv("DREAMZERO_DIT_DETAIL_TRACE_DIR")
+    if not trace_dir or not torch.is_tensor(value):
+        return
+    if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
+        return
+    if not bool(getattr(model, "_dz_trace_enabled", False)):
+        return
+    os.makedirs(trace_dir, exist_ok=True)
+    label = str(getattr(model, "_dz_trace_label", "unknown")).replace(" ", "_")
+    branch = int(getattr(model, "_dz_trace_branch", -1))
+    filename = f"{label}.branch{branch}.model.{suffix}.pt"
     torch.save(value.detach().cpu(), os.path.join(trace_dir, filename))
 
 
@@ -358,9 +430,7 @@ class DreamZeroCategorySpecificLinear(nn.Module):
             )
         if self.num_categories == 1:
             cat_ids = torch.zeros_like(cat_ids)
-        elif bool(
-            ((cat_ids < 0) | (cat_ids >= self.num_categories)).any().item()
-        ):
+        elif bool(((cat_ids < 0) | (cat_ids >= self.num_categories)).any().item()):
             raise ValueError(
                 "cat_ids must be in range "
                 f"[0, {self.num_categories}), got {cat_ids.detach().cpu().tolist()}."
@@ -592,11 +662,17 @@ class DreamZeroSelfAttention(nn.Module):
         q, _ = self.q(x)
         k, _ = self.k(x)
         v, _ = self.v(x)
+        _dit_detail_save(self, "self_attn.q_linear", q)
+        _dit_detail_save(self, "self_attn.k_linear", k)
+        _dit_detail_save(self, "self_attn.v_linear", v)
         q = self.norm_q(q)
         k = self.norm_k(k)
+        _dit_detail_save(self, "self_attn.q_norm", q)
+        _dit_detail_save(self, "self_attn.k_norm", k)
         q = q.reshape(batch_size, seq_len, self.num_local_heads, self.head_dim)
         k = k.reshape(batch_size, seq_len, self.num_local_heads, self.head_dim)
         v = v.reshape(batch_size, seq_len, self.num_local_heads, self.head_dim)
+        _dit_detail_save(self, "self_attn.v_heads", v)
         return q, k, v
 
     def _simple_forward(
@@ -1009,6 +1085,8 @@ class DreamZeroSelfAttention(nn.Module):
                 )
                 roped_query = torch.cat([rq_context, rq_noisy], dim=1)
                 roped_key = torch.cat([rk_context, rk_noisy], dim=1)
+                _dit_detail_save(self, "self_attn.roped_query", roped_query)
+                _dit_detail_save(self, "self_attn.roped_key", roped_key)
 
                 if action_register_length is not None:
                     clean_image_seq_len = half_seq_len
@@ -1146,6 +1224,8 @@ class DreamZeroSelfAttention(nn.Module):
                     action_horizon=action_horizon,
                     state_horizon=state_horizon,
                 )
+                _dit_detail_save(self, "self_attn.roped_query", roped_query)
+                _dit_detail_save(self, "self_attn.roped_key", roped_key)
         else:
             _validate_kv_cache(
                 kv_cache, batch_size, self.num_local_heads, self.head_dim
@@ -1173,6 +1253,8 @@ class DreamZeroSelfAttention(nn.Module):
                 num_state_per_block=self.num_state_per_block,
                 action_state_index=action_state_index,
             )
+            _dit_detail_save(self, "self_attn.roped_query", roped_query)
+            _dit_detail_save(self, "self_attn.roped_key", roped_key)
             roped_action_query = None
             roped_action_key = None
             action_v = None
@@ -1195,16 +1277,24 @@ class DreamZeroSelfAttention(nn.Module):
                     or action_v is None
                 ):
                     raise RuntimeError("Missing action/state tensors after split.")
-                x_heads = self.attn(
-                    torch.cat([roped_query, roped_action_query], dim=1),
-                    torch.cat([new_k, roped_action_key], dim=1),
-                    torch.cat([new_v, action_v], dim=1),
-                )
+                attn_query = torch.cat([roped_query, roped_action_query], dim=1)
+                attn_key = torch.cat([new_k, roped_action_key], dim=1)
+                attn_value = torch.cat([new_v, action_v], dim=1)
             else:
-                x_heads = self.attn(roped_query, new_k, new_v)
+                attn_query = roped_query
+                attn_key = new_k
+                attn_value = new_v
+            _dit_detail_save(self, "self_attn.attn_query", attn_query)
+            _dit_detail_save(self, "self_attn.attn_key", attn_key)
+            _dit_detail_save(self, "self_attn.attn_value", attn_value)
+            x_heads = self.attn(attn_query, attn_key, attn_value)
             updated_kv_cache = torch.stack([new_k, new_v], dim=0)
 
-        out, _ = self.o(x_heads.reshape(batch_size, x_heads.shape[1], -1))
+        _dit_detail_save(self, "self_attn.attn_heads", x_heads)
+        merged = x_heads.reshape(batch_size, x_heads.shape[1], -1)
+        _dit_detail_save(self, "self_attn.attn_merged", merged)
+        out, _ = self.o(merged)
+        _dit_detail_save(self, "self_attn.o_output", out)
         if use_cache and updated_kv_cache is None:
             updated_kv_cache = torch.stack([k, v], dim=0)
         return out, updated_kv_cache
@@ -1282,6 +1372,7 @@ class DreamZeroCrossAttention(nn.Module):
         self.num_heads = config.dit.num_heads
         self.num_local_heads = self.q.output_size_per_partition // head_dim
         self.head_dim = head_dim
+        self.use_fa2_cross_attention = attn_backend == "te"
         self.attn = Attention(
             num_heads=self.num_local_heads,
             head_dim=head_dim,
@@ -1311,14 +1402,20 @@ class DreamZeroCrossAttention(nn.Module):
         context_text = context[:, image_context_tokens:]
 
         q, _ = self.q(x)
+        _dit_detail_save(self, "cross_attn.q_linear", q)
         q = self.norm_q(q)
+        _dit_detail_save(self, "cross_attn.q_norm", q)
         q = q.reshape(batch_size, seq_len, self.num_local_heads, self.head_dim)
+        _dit_detail_save(self, "cross_attn.q_heads", q)
 
         if crossattn_cache is None:
             k, _ = self.k(context_text)
             v, _ = self.v(context_text)
+            _dit_detail_save(self, "cross_attn.text.k_linear", k)
+            _dit_detail_save(self, "cross_attn.text.v_linear", v)
             text_seq_len = context_text.shape[1]
             k = self.norm_k(k)
+            _dit_detail_save(self, "cross_attn.text.k_norm", k)
             k = k.reshape(batch_size, text_seq_len, self.num_local_heads, self.head_dim)
             v = v.reshape(batch_size, text_seq_len, self.num_local_heads, self.head_dim)
         else:
@@ -1327,21 +1424,40 @@ class DreamZeroCrossAttention(nn.Module):
             )
             k = crossattn_cache[0]
             v = crossattn_cache[1]
+        _dit_detail_save(self, "cross_attn.text.k_heads", k)
+        _dit_detail_save(self, "cross_attn.text.v_heads", v)
 
         k_img, _ = self.k_img(context_img)
         v_img, _ = self.v_img(context_img)
+        _dit_detail_save(self, "cross_attn.image.k_linear", k_img)
+        _dit_detail_save(self, "cross_attn.image.v_linear", v_img)
         k_img = self.norm_k_img(k_img)
+        _dit_detail_save(self, "cross_attn.image.k_norm", k_img)
         k_img = k_img.reshape(
             batch_size, image_context_tokens, self.num_local_heads, self.head_dim
         )
         v_img = v_img.reshape(
             batch_size, image_context_tokens, self.num_local_heads, self.head_dim
         )
+        _dit_detail_save(self, "cross_attn.image.k_heads", k_img)
+        _dit_detail_save(self, "cross_attn.image.v_heads", v_img)
 
-        text_out = self.attn(q, k, v)
-        image_out = self.attn(q, k_img, v_img)
-        out = (text_out + image_out).reshape(batch_size, seq_len, -1)
-        out, _ = self.o(out)
+        if self.use_fa2_cross_attention:
+            text_out = _dreamzero_fa2_cross_attention(q, k, v)
+        else:
+            text_out = self.attn(q, k, v)
+        _dit_detail_save(self, "cross_attn.text.attn_heads", text_out)
+        if self.use_fa2_cross_attention:
+            image_out = _dreamzero_fa2_cross_attention(q, k_img, v_img)
+        else:
+            image_out = self.attn(q, k_img, v_img)
+        _dit_detail_save(self, "cross_attn.image.attn_heads", image_out)
+        summed_heads = text_out + image_out
+        _dit_detail_save(self, "cross_attn.attn_sum_heads", summed_heads)
+        merged = summed_heads.reshape(batch_size, seq_len, -1)
+        _dit_detail_save(self, "cross_attn.attn_merged", merged)
+        out, _ = self.o(merged)
+        _dit_detail_save(self, "cross_attn.o_output", out)
 
         updated_crossattn_cache = None
         if use_cache or crossattn_cache is not None:
@@ -1494,6 +1610,16 @@ class DreamZeroDiTBlock(nn.Module):
 
         self_attn_input = self.norm1(x) * (1 + e1) + e0
         _dit_detail_save(self, "self_attn_input", self_attn_input)
+        self.self_attn._dz_trace_enabled = bool(
+            getattr(self, "_dz_trace_enabled", False)
+        )
+        self.self_attn._dz_trace_label = str(
+            getattr(self, "_dz_trace_label", "unknown")
+        )
+        self.self_attn._dz_trace_branch = int(getattr(self, "_dz_trace_branch", -1))
+        self.self_attn._dz_trace_block_index = int(
+            getattr(self, "_dz_trace_block_index", -1)
+        )
         y, updated_kv_cache = self.self_attn(
             self_attn_input,
             freqs=freqs,
@@ -1510,6 +1636,16 @@ class DreamZeroDiTBlock(nn.Module):
 
         cross_attn_input = self.norm3(x)
         _dit_detail_save(self, "cross_attn_input", cross_attn_input)
+        self.cross_attn._dz_trace_enabled = bool(
+            getattr(self, "_dz_trace_enabled", False)
+        )
+        self.cross_attn._dz_trace_label = str(
+            getattr(self, "_dz_trace_label", "unknown")
+        )
+        self.cross_attn._dz_trace_branch = int(getattr(self, "_dz_trace_branch", -1))
+        self.cross_attn._dz_trace_block_index = int(
+            getattr(self, "_dz_trace_block_index", -1)
+        )
         y, updated_crossattn_cache = self.cross_attn(
             cross_attn_input,
             context,
@@ -1669,7 +1805,8 @@ class DreamZeroDiT(nn.Module):
             {
                 "proj_0_norm": LayerNorm(
                     1280,
-                    eps=config.dit.eps,
+                    # MLPProj uses torch.nn.LayerNorm's default epsilon.
+                    eps=1e-5,
                     bias=True,
                     backend=norm_backend,
                     dtype=params_dtype,
@@ -1694,7 +1831,7 @@ class DreamZeroDiT(nn.Module):
                 ),
                 "proj_4_norm": LayerNorm(
                     config.dit.dim,
-                    eps=config.dit.eps,
+                    eps=1e-5,
                     bias=True,
                     backend=norm_backend,
                     dtype=params_dtype,
@@ -1827,10 +1964,21 @@ class DreamZeroDiT(nn.Module):
         y: torch.Tensor | None,
         *,
         concat_first_frame_latent: bool,
+        trace_prefix: str,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        _dit_model_detail_save(self, f"{trace_prefix}.input", x)
+        _dit_model_detail_save(self, f"{trace_prefix}.condition_y", y)
         if y is not None and concat_first_frame_latent:
             x = torch.cat([x, y.to(dtype=x.dtype)], dim=1)
+        _dit_model_detail_save(self, f"{trace_prefix}.patch_input", x)
+        _dit_model_detail_save(
+            self, f"{trace_prefix}.patch_weight", self.patch_embedding.weight
+        )
+        _dit_model_detail_save(
+            self, f"{trace_prefix}.patch_bias", self.patch_embedding.bias
+        )
         x = self.patch_embedding(x)
+        _dit_model_detail_save(self, f"{trace_prefix}.patch_output", x)
         grid_size = torch.tensor(x.shape[2:], dtype=torch.long, device=x.device)
         return x.flatten(start_dim=2).transpose(1, 2), grid_size
 
@@ -1933,10 +2081,15 @@ class DreamZeroDiT(nn.Module):
             )
             e0 = torch.cat([e0_clean, e0], dim=1)
 
+        _dit_model_detail_save(self, "raw_text_context", context)
+        _dit_model_detail_save(self, "raw_clip_feature", clip_feature)
         context = self._text_embedding(context)
+        _dit_model_detail_save(self, "projected_text_context", context)
         if clip_feature is not None:
             clip_embedding = self._img_embedding(clip_feature)
+            _dit_model_detail_save(self, "projected_image_context", clip_embedding)
             context = torch.cat([clip_embedding, context], dim=1)
+        _dit_model_detail_save(self, "projected_context", context)
 
         if kv_cache is None:
             kv_cache = [None] * len(self.blocks)
@@ -2015,8 +2168,18 @@ class DreamZeroDiT(nn.Module):
         list[torch.Tensor | None],
         list[torch.Tensor | None],
     ]:
+        _dit_model_detail_save(
+            self,
+            "current_start_frame",
+            torch.tensor(current_start_frame, device=x.device),
+        )
+        if kv_cache and kv_cache[0] is not None:
+            _dit_model_detail_save(self, "kv_cache.layer0", kv_cache[0])
         x_tokens, grid_size = self._prepare_video_tokens(
-            x, y, concat_first_frame_latent=concat_first_frame_latent
+            x,
+            y,
+            concat_first_frame_latent=concat_first_frame_latent,
+            trace_prefix="video",
         )
         if seq_len is None:
             seq_len = x_tokens.shape[1]
@@ -2028,7 +2191,10 @@ class DreamZeroDiT(nn.Module):
         clean_tokens = None
         if clean_x is not None:
             clean_tokens, clean_grid_size = self._prepare_video_tokens(
-                clean_x, y, concat_first_frame_latent=concat_first_frame_latent
+                clean_x,
+                y,
+                concat_first_frame_latent=concat_first_frame_latent,
+                trace_prefix="clean_video",
             )
             if not torch.equal(clean_grid_size, grid_size):
                 raise ValueError("clean_x grid size must match x grid size.")

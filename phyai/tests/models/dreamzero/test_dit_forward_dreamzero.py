@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 
 import phyai.layers.linear as L
+import phyai.models.dreamzero.modeling_dreamzero as modeling
 from phyai.layers import LayerNorm, RMSNorm
 from phyai.models.dreamzero import (
     DreamZeroConfig,
@@ -59,6 +60,123 @@ def _init_tiny_model(model: nn.Module) -> None:
             param.data.zero_()
         else:
             param.data.normal_(mean=0.0, std=0.02)
+
+
+def test_dreamzero_fa2_cross_attention_matches_official_call(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_flash_attn_varlen_func(**kwargs):
+        captured.update(kwargs)
+        return kwargs["q"].clone()
+
+    monkeypatch.setattr(
+        modeling,
+        "_get_flash_attn_varlen_func",
+        lambda: fake_flash_attn_varlen_func,
+    )
+    query = torch.randn(2, 3, 2, 4, dtype=torch.float64)
+    key = torch.randn(2, 5, 2, 4, dtype=torch.float32)
+    value = torch.randn(2, 5, 2, 4, dtype=torch.float16)
+
+    output = modeling._dreamzero_fa2_cross_attention(query, key, value)
+
+    assert output.dtype == query.dtype
+    assert output.shape == query.shape
+    torch.testing.assert_close(
+        output,
+        query.flatten(0, 1).to(value.dtype).unflatten(0, (2, 3)).to(query.dtype),
+        rtol=0,
+        atol=0,
+    )
+    assert captured["q"].shape == (6, 2, 4)
+    assert captured["k"].shape == (10, 2, 4)
+    assert captured["v"].shape == (10, 2, 4)
+    assert captured["q"].dtype == value.dtype
+    assert captured["k"].dtype == value.dtype
+    torch.testing.assert_close(
+        captured["cu_seqlens_q"], torch.tensor([0, 3, 6], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        captured["cu_seqlens_k"], torch.tensor([0, 5, 10], dtype=torch.int32)
+    )
+    assert captured["max_seqlen_q"] == 3
+    assert captured["max_seqlen_k"] == 5
+    assert captured["dropout_p"] == 0.0
+    assert captured["softmax_scale"] is None
+    assert captured["causal"] is False
+    assert captured["window_size"] == (-1, -1)
+    assert captured["deterministic"] is False
+
+
+def test_dreamzero_cross_attention_uses_fa2_only_for_te(fake_mesh, monkeypatch) -> None:
+    fake_mesh(sizes={"tp": 1})
+    _init_linear_dispatcher()
+
+    class RecordingAttention(nn.Module):
+        def __init__(self, *args, backend: str, **kwargs) -> None:
+            super().__init__()
+            self.backend = backend
+            self.calls = 0
+
+        def forward(
+            self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+        ) -> torch.Tensor:
+            self.calls += 1
+            return query
+
+    fa2_calls: list[tuple[torch.Size, torch.Size, torch.Size]] = []
+
+    def fake_fa2(
+        query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+    ) -> torch.Tensor:
+        fa2_calls.append((query.shape, key.shape, value.shape))
+        return query
+
+    monkeypatch.setattr(modeling, "Attention", RecordingAttention)
+    monkeypatch.setattr(modeling, "_dreamzero_fa2_cross_attention", fake_fa2)
+    x = torch.randn(1, 4, 16)
+    context = torch.randn(1, 3, 16)
+
+    te_attention = modeling.DreamZeroCrossAttention(
+        _tiny_config(),
+        params_dtype=torch.float32,
+        device="cpu",
+        attn_backend="te",
+        norm_backend="torch",
+    )
+    te_attention(x, context, image_context_tokens=2)
+
+    assert len(fa2_calls) == 2
+    assert te_attention.attn.calls == 0
+
+    eager_attention = modeling.DreamZeroCrossAttention(
+        _tiny_config(),
+        params_dtype=torch.float32,
+        device="cpu",
+        attn_backend="eager",
+        norm_backend="torch",
+    )
+    eager_attention(x, context, image_context_tokens=2)
+
+    assert len(fa2_calls) == 2
+    assert eager_attention.attn.calls == 2
+
+
+def test_dreamzero_image_projection_matches_official_layer_norm_epsilon(
+    fake_mesh,
+) -> None:
+    fake_mesh(sizes={"tp": 1})
+    _init_linear_dispatcher()
+    model = DreamZeroDiT(
+        _tiny_config(),
+        params_dtype=torch.float32,
+        device="cpu",
+        attn_backend="eager",
+        norm_backend="torch",
+    )
+
+    assert model.img_emb["proj_0_norm"].variance_epsilon == 1e-5
+    assert model.img_emb["proj_4_norm"].variance_epsilon == 1e-5
 
 
 def test_dreamzero_dit_full_forward_with_action_registers(fake_mesh) -> None:
@@ -129,8 +247,6 @@ def test_dreamzero_dit_runner_owns_and_updates_kv_cache(fake_mesh) -> None:
     assert output.action is not None
     assert output.action.shape == (1, 2, 4)
     assert len(runner.kv_cache) == 2
-    assert runner._kv_cache is not None
-    assert runner._kv_cache.seq_len == 4
     assert all(cache is not None for cache in runner.kv_cache)
     for cache in runner.kv_cache:
         assert cache is not None
@@ -139,8 +255,6 @@ def test_dreamzero_dit_runner_owns_and_updates_kv_cache(fake_mesh) -> None:
     runner.reset()
     assert runner.kv_cache == []
     assert runner.crossattn_cache == []
-    assert runner._kv_cache is not None
-    assert runner._kv_cache.seq_len == 0
 
 
 def test_dreamzero_dit_runner_rejects_cache_capacity_overflow(fake_mesh) -> None:
@@ -169,5 +283,5 @@ def test_dreamzero_dit_runner_rejects_cache_capacity_overflow(fake_mesh) -> None
 
     import pytest
 
-    with pytest.raises(ValueError, match="exceeds capacity"):
+    with pytest.raises(ValueError, match="exceeds configured"):
         runner.forward(batch)

@@ -97,7 +97,7 @@ def test_build_dreamzero_minimal_pipeline_wires_components(
     bundle = build_dreamzero_minimal_pipeline(
         DreamZeroBuildOptions(
             checkpoint_dir=tmp_path,
-            dtype=torch.float32,
+            dtype=torch.bfloat16,
             device="cpu",
             seed=7,
             weight_strict=True,
@@ -115,7 +115,8 @@ def test_build_dreamzero_minimal_pipeline_wires_components(
     assert bundle.scheduler.use_cfg_runner is False
     assert bundle.dit.kwargs["attn_backend"] == "eager"
     assert bundle.dit.kwargs["norm_backend"] == "torch"
-    assert bundle.text_encoder.kwargs["params_dtype"] is torch.float32
+    assert bundle.dit.kwargs["params_dtype"] is torch.bfloat16
+    assert bundle.text_encoder.kwargs["params_dtype"] is torch.bfloat16
     assert bundle.image_encoder.kwargs["params_dtype"] is torch.float32
     assert [name for name, *_ in load_calls] == [
         "dit",
@@ -141,6 +142,6 @@ def test_build_dreamzero_rejects_unimplemented_encoder_strategy(tmp_path) -> Non
     try:
         build_dreamzero_minimal_pipeline(options)
     except ValueError as exc:
-        assert "encoder_strategy='replicated'" in str(exc)
+        assert "must be 'replicated' or 'rank0_broadcast'" in str(exc)
     else:
         raise AssertionError("expected unsupported encoder strategy to fail")

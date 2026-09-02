@@ -7,6 +7,10 @@ from phyai.models.dreamzero import (
     DreamZeroImageEncoderRunner,
     DreamZeroWanImageEncoder,
 )
+from phyai.models.dreamzero.image_encoder_wan import (
+    CLIP_IMAGE_MEAN,
+    CLIP_IMAGE_STD,
+)
 
 
 def tiny_image_encoder_config() -> DreamZeroImageEncoderConfig:
@@ -54,6 +58,19 @@ def test_dreamzero_wan_image_encoder_preprocess_matches_clip_grid() -> None:
 
     assert pixel_values.shape == (2, 3, 8, 8)
     assert pixel_values.dtype == videos.dtype
+
+
+def test_image_preprocess_keeps_clip_constants_at_compute_dtype() -> None:
+    cfg = tiny_image_encoder_config()
+    model = DreamZeroWanImageEncoder(cfg).to(dtype=torch.bfloat16)
+    videos = torch.zeros(1, 1, 3, 8, 8, dtype=torch.float32)
+
+    pixel_values = model.preprocess(videos)
+
+    mean = torch.tensor(CLIP_IMAGE_MEAN).view(1, 3, 1, 1)
+    std = torch.tensor(CLIP_IMAGE_STD).view(1, 3, 1, 1)
+    expected = ((torch.zeros_like(pixel_values) + 0.5) - mean) / std
+    torch.testing.assert_close(pixel_values, expected, rtol=0, atol=0)
 
 
 def test_dreamzero_image_encoder_runner_accepts_preprocessed_pixels() -> None:

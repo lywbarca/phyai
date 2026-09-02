@@ -36,8 +36,8 @@ def resolve_device(name: str) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt-dir", default="/data/share/DreamZero-DROID")
-    parser.add_argument("--tokenizer", default="/data/share/google-umt5-xxl")
+    parser.add_argument("--ckpt-dir", required=True)
+    parser.add_argument("--tokenizer", required=True)
     parser.add_argument("--device", default="cuda", choices=("cuda", "cpu"))
     parser.add_argument(
         "--dtype",
@@ -50,6 +50,14 @@ def main() -> None:
     parser.add_argument("--height", type=int, default=224)
     parser.add_argument("--width", type=int, default=224)
     parser.add_argument("--frames", type=int, default=1)
+    parser.add_argument(
+        "--chunk-frames",
+        type=int,
+        default=4,
+        help="Number of raw video frames for chunks after the first one.",
+    )
+    parser.add_argument("--num-chunks", type=int, default=1)
+    parser.add_argument("--num-inference-steps", type=int, default=None)
     parser.add_argument("--views", type=int, default=3)
     parser.add_argument("--state-dim", type=int, default=8)
     parser.add_argument("--prompt", default="Pick up the cube.")
@@ -57,6 +65,7 @@ def main() -> None:
     parser.add_argument("--norm-backend", default="flashinfer")
     parser.add_argument("--allow-tf32", action="store_true")
     parser.add_argument("--non-strict", action="store_true")
+    parser.add_argument("--sequential-cpu-offload", action="store_true")
     args = parser.parse_args()
 
     if args.device == "cuda" and not args.allow_tf32:
@@ -85,6 +94,8 @@ def main() -> None:
                 seed=args.seed,
                 weight_strict=not args.non_strict,
                 progress=True,
+                sequential_cpu_offload=args.sequential_cpu_offload,
+                num_inference_steps=args.num_inference_steps,
             ),
             config=config,
         )
@@ -100,24 +111,43 @@ def main() -> None:
             action_horizon=bundle.config.action_horizon,
             num_views=args.views,
         )
-        video = torch.randint(
-            0,
-            256,
-            (1, args.frames, args.views, args.height, args.width, 3),
-            dtype=torch.uint8,
-        )
         state = torch.zeros(1, 1, args.state_dim, dtype=torch.float32)
         policy = DreamZeroPolicy(processor=processor, infer=engine.step)
-        policy_out = policy.act({"video": video, "task": [args.prompt], "state": state})
-        out = policy_out.model_output
         rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
-        if rank == 0:
-            print(
-                "DreamZero minimal pipeline real smoke passed: "
-                f"video={tuple(out.video.shape)} action={tuple(out.action.shape)} "
-                f"post_action={tuple(policy_out.action.shape)} "
-                f"dtype={out.action.dtype} device={out.action.device}"
+        for chunk_idx in range(args.num_chunks):
+            frames = args.frames if chunk_idx == 0 else args.chunk_frames
+            video = torch.randint(
+                0,
+                256,
+                (1, frames, args.views, args.height, args.width, 3),
+                dtype=torch.uint8,
             )
+            policy_out = policy.act(
+                {"video": video, "task": [args.prompt], "state": state}
+            )
+            out = policy_out.model_output
+            scheduler_out = out.scheduler_output
+            request = out.request
+            cond_lens = [
+                None if cache is None else int(cache.shape[2])
+                for cache in scheduler_out.cond_kv_cache
+            ]
+            if rank == 0:
+                non_empty_lens = [length for length in cond_lens if length is not None]
+                min_cache_len = min(non_empty_lens) if non_empty_lens else 0
+                max_cache_len = max(non_empty_lens) if non_empty_lens else 0
+                print(
+                    "DreamZero chunk passed: "
+                    f"chunk={chunk_idx} raw_frames={frames} "
+                    f"request_start={request.current_start_frame} "
+                    f"next_start={scheduler_out.current_start_frame} "
+                    f"reference_video={request.reference_video is not None} "
+                    f"video={tuple(out.video.shape)} action={tuple(out.action.shape)} "
+                    f"post_action={tuple(policy_out.action.shape)} "
+                    f"kv_len_range=({min_cache_len},{max_cache_len}) "
+                    f"dtype={out.action.dtype} device={out.action.device}",
+                    flush=True,
+                )
     finally:
         engine.close()
 
