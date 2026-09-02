@@ -34,6 +34,8 @@ from phyai.layers.attention.attention import (
     FlashInferAttentionPlan,
     SdpaAttentionBackend,
     SdpaAttentionPlan,
+    TransformerEngineAttentionBackend,
+    TransformerEngineAttentionPlan,
 )
 from phyai.layers.attention.attention import (
     get_backend_factory as get_attention_backend_factory,
@@ -109,6 +111,8 @@ __all__ = [
     "FlashInferAttentionPlan",
     "SdpaAttentionBackend",
     "SdpaAttentionPlan",
+    "TransformerEngineAttentionBackend",
+    "TransformerEngineAttentionPlan",
     "get_attention_backend_factory",
     "list_attention_backends",
     "register_attention_backend",

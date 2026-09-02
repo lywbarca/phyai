@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 
 import phyai.layers.linear as L
-from phyai.layers.layer_norm import AdaRMSNorm, LayerNorm
+from phyai.layers.layer_norm import AdaRMSNorm, LayerNorm, RMSNorm
 from phyai.parallel.mesh import Mesh
 from phyai.parallel.state import _meshes, register_mesh
 
@@ -94,7 +94,7 @@ def _ref_layer_norm(
 
 
 @cuda_only
-@pytest.mark.parametrize("backend", ["flashinfer", "phyai-kernel"])
+@pytest.mark.parametrize("backend", ["flashinfer", "phyai-kernel", "torch"])
 @pytest.mark.parametrize("with_bias", [True, False])
 def test_forward_matches_torch_reference_bf16(backend, with_bias):
     torch.manual_seed(0)
@@ -152,7 +152,7 @@ def test_phyai_kernel_higher_rank_input():
 
 
 @cuda_only
-@pytest.mark.parametrize("backend", ["flashinfer", "phyai-kernel"])
+@pytest.mark.parametrize("backend", ["flashinfer", "phyai-kernel", "torch"])
 def test_no_bias_path_matches_reference(backend):
     """``bias=False`` must give identical output to F.layer_norm(..., bias=None)."""
     torch.manual_seed(3)
@@ -182,6 +182,53 @@ def test_phyai_kernel_fp32_path():
     y = m(x)
     ref = _ref_layer_norm(x, src_w, src_b, m.variance_epsilon)
     torch.testing.assert_close(y, ref, atol=1e-5, rtol=1e-5)
+
+
+@cuda_only
+def test_torch_rmsnorm_matches_dreamzero_rounding_order_exactly():
+    torch.manual_seed(5)
+    hidden = 128
+    module = RMSNorm(
+        hidden,
+        eps=1e-6,
+        backend="torch",
+        dtype=torch.bfloat16,
+    ).cuda()
+    weight = (torch.randn(hidden, device="cuda") * 0.05 + 1.0).to(torch.bfloat16)
+    module.weight.data.copy_(weight)
+    x = torch.randn(32, 40, hidden, device="cuda", dtype=torch.bfloat16)
+
+    actual = module(x)
+    expected = (
+        x.float() * torch.rsqrt(x.float().pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+    ).to(x.dtype) * weight
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@cuda_only
+def test_torch_layernorm_matches_pytorch_exactly():
+    torch.manual_seed(6)
+    hidden = 512
+    module = LayerNorm(
+        hidden,
+        eps=1e-6,
+        backend="torch",
+        bias=True,
+        dtype=torch.bfloat16,
+    ).cuda()
+    x = torch.randn(8, 16, hidden, device="cuda", dtype=torch.bfloat16)
+
+    actual = module(x)
+    expected = F.layer_norm(
+        x,
+        (hidden,),
+        module.weight.data,
+        module.bias.data,
+        module.variance_epsilon,
+    )
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 # --------------------------------------------------------------------------- #

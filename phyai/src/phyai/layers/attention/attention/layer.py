@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 import math
+import os
 from typing import Any
 
 import torch
@@ -15,6 +17,9 @@ from phyai.layers.attention.attention.base import (
 )
 from phyai.layers.attention.attention.registry import get_backend_factory
 from phyai.layers.attention.enums import AttnLayout, AttnMode
+
+
+_TRACED_BACKENDS: set[tuple[str, str]] = set()
 
 
 class Attention(nn.Module):
@@ -43,7 +48,9 @@ class Attention(nn.Module):
         If set, apply ``cap * tanh(logits / cap)`` to attention logits
         before softmax (Gemma2 / Grok / Gemini style).
     backend:
-        ``"flashinfer"`` (default), ``"sdpa"``, or ``"eager"``. Resolved
+        ``"flashinfer"`` (default), ``"te"``, ``"sdpa"``, or ``"eager"``.
+        ``"te"`` follows the official DreamZero Transformer Engine/cuDNN path.
+        Resolved
         through :func:`~phyai.layers.attention.attention.registry.get_backend_factory`.
     backend_kwargs:
         Optional dict forwarded to the backend factory after ``runner``.
@@ -198,6 +205,16 @@ class Attention(nn.Module):
     def _ensure_backend(self) -> AttentionBackend:
         if self._lazy_backend is None:
             self._lazy_backend = self._backend_factory(None, **self._backend_kwargs)
+            if os.getenv("PHYAI_TRACE_ATTENTION_BACKEND") == "1":
+                backend_class = type(self._lazy_backend).__qualname__
+                key = (self.backend, backend_class)
+                if key not in _TRACED_BACKENDS:
+                    _TRACED_BACKENDS.add(key)
+                    logging.getLogger(__name__).info(
+                        "resolved attention backend name=%s class=%s",
+                        self.backend,
+                        backend_class,
+                    )
         return self._lazy_backend
 
     # ------------------------------------------------------------------ #

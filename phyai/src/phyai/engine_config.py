@@ -95,7 +95,9 @@ class BackendConfig:
         registry. Production names: ``"flashinfer"`` (default) /
         ``"sdpa"`` / ``"eager"``. ``"sdpa"`` and ``"eager"`` only
         register in the no-cache stack — the AR and diffusion paged
-        stacks are flashinfer-only (GPU). Code that picks paged
+        stacks are flashinfer-only (GPU). ``"te"`` is available in the
+        no-cache stack for the official DreamZero cuDNN attention path. Code
+        that picks paged
         backends rejects non-flashinfer names (see
         ``_engine_to_paged_backend`` in pi05's ``modeling_pi05``).
     norm:

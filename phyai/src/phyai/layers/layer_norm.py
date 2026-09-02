@@ -15,7 +15,7 @@ Three related modules in this file:
 Backend selection (constructor ``backend=``):
 
 * :class:`RMSNorm` / :class:`GemmaRMSNorm` / :class:`LayerNorm`:
-  ``"flashinfer"`` (default) or ``"phyai-kernel"``.
+  ``"flashinfer"`` (default), ``"phyai-kernel"``, or ``"torch"``.
 * :class:`AdaRMSNorm`: ``"phyai-kernel"`` (default, Triton on CUDA) or
   ``"torch"`` (eager fallback for CPU / MPS / non-CUDA). flashinfer has
   no AdaRMS kernel, so that backend is rejected.
@@ -39,7 +39,7 @@ from phyai.engine_config import get_engine_config
 from phyai.layers.linear import ReplicatedLinear
 from phyai.weights.shards import replicated
 
-_VALID_BACKENDS: tuple[str, ...] = ("flashinfer", "phyai-kernel")
+_VALID_BACKENDS: tuple[str, ...] = ("flashinfer", "phyai-kernel", "torch")
 
 
 def list_norm_backends() -> list[str]:
@@ -75,8 +75,10 @@ class RMSNorm(nn.Module):
     eps:
         Added to the variance before ``rsqrt`` for numerical stability.
     backend:
-        ``"flashinfer"`` (default) or ``"phyai-kernel"``. Underscore,
-        hyphen, and case are normalized.
+        ``"flashinfer"`` (default), ``"phyai-kernel"``, or ``"torch"``.
+        Underscore, hyphen, and case are normalized. The torch backend casts
+        the normalized value back to the input dtype before multiplying by
+        the weight, matching the reference DreamZero RMSNorm rounding order.
     dtype:
         Optional weight dtype. Defaults to the global default dtype.
         **flashinfer caveat**: the CUDA RMSNorm / GemmaRMSNorm /
@@ -147,6 +149,20 @@ class RMSNorm(nn.Module):
 
             def fused_add_rmsnorm(x, residual, weight, eps):
                 _fi_fused_add_rmsnorm(x, residual, weight, eps)
+                return x, residual
+
+            return rmsnorm, fused_add_rmsnorm
+        if backend == "torch":
+
+            def rmsnorm(x, weight, eps):
+                normalized = x.float() * torch.rsqrt(
+                    x.float().pow(2).mean(dim=-1, keepdim=True) + eps
+                )
+                return normalized.to(dtype=x.dtype) * weight
+
+            def fused_add_rmsnorm(x, residual, weight, eps):
+                residual.add_(x)
+                x.copy_(rmsnorm(residual, weight, eps))
                 return x, residual
 
             return rmsnorm, fused_add_rmsnorm
@@ -238,7 +254,7 @@ class LayerNorm(nn.Module):
         :class:`torch.nn.LayerNorm`; ViT-style configs typically use
         ``1e-6``.
     backend:
-        ``"flashinfer"`` (default) or ``"phyai-kernel"``.
+        ``"flashinfer"`` (default), ``"phyai-kernel"``, or ``"torch"``.
     bias:
         Whether to allocate a learnable ``beta``. Defaults to ``True``
         (the typical encoder configuration). flashinfer's kernel always
@@ -328,6 +344,18 @@ class LayerNorm(nn.Module):
     def _load_kernel(backend: str) -> Callable:
         if backend == "flashinfer":
             from flashinfer.norm import layernorm
+
+            return layernorm
+        if backend == "torch":
+
+            def layernorm(x, weight, bias, eps):
+                return torch.nn.functional.layer_norm(
+                    x,
+                    (x.shape[-1],),
+                    weight=weight,
+                    bias=bias,
+                    eps=eps,
+                )
 
             return layernorm
         from phyai_kernel import layernorm

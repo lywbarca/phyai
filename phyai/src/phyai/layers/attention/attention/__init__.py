@@ -5,6 +5,7 @@ ViT-style attention, no KV cache, no per-layer state. The
 attention output in the same layout. Backends:
 
 * ``"flashinfer"`` (default) — single-prefill / batch-prefill ragged.
+* ``"te"`` — official DreamZero Transformer Engine/cuDNN fused attention.
 * ``"sdpa"`` — :func:`torch.nn.functional.scaled_dot_product_attention`,
   optionally compiled.
 * ``"eager"`` — pure PyTorch reference.
@@ -22,6 +23,8 @@ from phyai.layers.attention.attention.backends import (
     FlashInferAttentionPlan,
     SdpaAttentionBackend,
     SdpaAttentionPlan,
+    TransformerEngineAttentionBackend,
+    TransformerEngineAttentionPlan,
 )
 from phyai.layers.attention.attention.base import (
     AttentionBackend,
@@ -53,6 +56,8 @@ __all__ = [
     "FlashInferAttentionPlan",
     "SdpaAttentionBackend",
     "SdpaAttentionPlan",
+    "TransformerEngineAttentionBackend",
+    "TransformerEngineAttentionPlan",
     "get_backend_factory",
     "list_backends",
     "register_backend",

@@ -6,7 +6,8 @@ handle types it consumes) and self-registers via the
 decorator at module import. Importing this package executes those
 side effects and surfaces the public classes through the names below.
 
-Three backend names — ``"sdpa"`` / ``"flashinfer"`` / ``"eager"``.
+Four backend names — ``"sdpa"`` / ``"flashinfer"`` / ``"eager"`` /
+``"te"``.
 """
 
 from __future__ import annotations
@@ -23,6 +24,10 @@ from phyai.layers.attention.attention.backends.sdpa import (
     SdpaAttentionBackend,
     SdpaAttentionPlan,
 )
+from phyai.layers.attention.attention.backends.te import (
+    TransformerEngineAttentionBackend,
+    TransformerEngineAttentionPlan,
+)
 
 
 __all__ = [
@@ -32,4 +37,6 @@ __all__ = [
     "FlashInferAttentionPlan",
     "SdpaAttentionBackend",
     "SdpaAttentionPlan",
+    "TransformerEngineAttentionBackend",
+    "TransformerEngineAttentionPlan",
 ]

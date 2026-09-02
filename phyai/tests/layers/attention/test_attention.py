@@ -1,7 +1,7 @@
 """Tests for :class:`phyai.layers.attention.attention.Attention`.
 
-Covers the three no-cache backends — ``"eager"``, ``"sdpa"``, and
-``"flashinfer"`` — across the padded (4-D) and ragged (3-D)
+Covers the four no-cache backends — ``"eager"``, ``"sdpa"``, ``"te"``,
+and ``"flashinfer"`` — across the padded (4-D) and ragged (3-D)
 dispatch paths plus the ``ctx=None`` convenience flow used by the
 vision tower. Numerical agreement between eager and sdpa is the
 primary correctness signal; flashinfer is gated on GPU + flashinfer
@@ -35,12 +35,25 @@ def _can_use_flashinfer() -> bool:
     return torch.cuda.is_available() and _has_flashinfer()
 
 
+def _has_transformer_engine() -> bool:
+    try:
+        import transformer_engine_torch  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+def _can_use_transformer_engine() -> bool:
+    return torch.cuda.is_available() and _has_transformer_engine()
+
+
 # --------------------------------------------------------------------- #
 # Construction                                                          #
 # --------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize("backend", ["eager", "sdpa"])
+@pytest.mark.parametrize("backend", ["eager", "sdpa", "te"])
 def test_construct_attention(backend: str):
     attn = Attention(
         num_heads=4,
@@ -324,6 +337,39 @@ def test_flashinfer_padded_b1_matches_eager():
     eager = Attention(num_heads=H, head_dim=D, backend="eager", causal=True)
     out_e = eager(q.float(), k.float(), v.float())
     assert torch.allclose(out_fi.float(), out_e, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(
+    not _can_use_transformer_engine(),
+    reason="TE attention requires CUDA + transformer-engine-torch.",
+)
+@pytest.mark.parametrize("causal", [False, True])
+def test_te_padded_b1_matches_eager(causal: bool):
+    """TE uses the official DreamZero dense BSHD fused-attention path."""
+    torch.manual_seed(9)
+    B, S, H, D = 1, 8, 4, 64
+    q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
+    te = Attention(num_heads=H, head_dim=D, backend="te", causal=causal)
+    out_te = te(q, k, v)
+    eager = Attention(num_heads=H, head_dim=D, backend="eager", causal=causal)
+    out_eager = eager(q.float(), k.float(), v.float())
+    assert out_te.shape == q.shape
+    assert torch.allclose(out_te.float(), out_eager, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(
+    not _can_use_transformer_engine(),
+    reason="TE attention requires CUDA + transformer-engine-torch.",
+)
+def test_te_ragged_raises():
+    H, D = 4, 64
+    cu_q = torch.tensor([0, 4], dtype=torch.int32, device="cuda")
+    q = torch.randn(4, H, D, device="cuda", dtype=torch.bfloat16)
+    te = Attention(num_heads=H, head_dim=D, backend="te", causal=False)
+    with pytest.raises(NotImplementedError, match="padded 4-D BSHD"):
+        te(q, q, q, cu_seqlens_q=cu_q)
 
 
 # --------------------------------------------------------------------- #
