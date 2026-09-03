@@ -17,6 +17,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
 from phyai.engine import Engine, EngineArgs
 from phyai.engine_config import (
@@ -79,6 +80,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=1140)
     parser.add_argument("--num-inference-steps", type=int, default=None)
     parser.add_argument(
+        "--tp-size",
+        type=int,
+        default=2,
+        help="Tensor-parallel degree. Launch tp-size * cfg-size processes.",
+    )
+    parser.add_argument(
+        "--cfg-size",
+        type=int,
+        choices=(1, 2),
+        default=2,
+        help="CFG-parallel degree. DreamZero supports 1 or 2.",
+    )
+    parser.add_argument(
         "--dynamic-dit",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -98,9 +112,8 @@ def parse_args() -> argparse.Namespace:
         "--sequential-cpu-offload",
         action="store_true",
         help=(
-            "Offload inactive modules to CPU. This is required by the current "
-            "resident model on one 48 GB A40, but transfer time remains in the "
-            "engine.step measurement."
+            "Offload inactive modules to CPU. Intended only for functional "
+            "diagnostics; transfer time remains in the engine.step measurement."
         ),
     )
     parser.add_argument(
@@ -147,6 +160,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--warmup-runs must be non-negative.")
     if args.dynamic_dit_scheduler_steps < 2:
         raise ValueError("--dynamic-dit-scheduler-steps must be at least 2.")
+    if args.tp_size <= 0:
+        raise ValueError("--tp-size must be positive.")
     if args.torch_profiler and args.repetitions != 1:
         raise ValueError("Use --repetitions 1 with --torch-profiler.")
     if args.torch_profiler and args.cuda_profiler_range:
@@ -156,10 +171,29 @@ def validate_args(args: argparse.Namespace) -> None:
     if not args.validate_input_only and not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for DreamZero chunk profiling.")
 
+    requested_world_size = args.tp_size * args.cfg_size
+    launched_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if not args.validate_input_only and launched_world_size != requested_world_size:
+        raise RuntimeError(
+            f"Requested tp={args.tp_size}, cfg={args.cfg_size}, which requires "
+            f"WORLD_SIZE={requested_world_size}, but the launch has "
+            f"WORLD_SIZE={launched_world_size}. Use torchrun "
+            f"--nproc-per-node={requested_world_size}."
+        )
+    if (
+        not args.validate_input_only
+        and requested_world_size > torch.cuda.device_count()
+    ):
+        raise RuntimeError(
+            f"The topology needs {requested_world_size} visible GPUs, but only "
+            f"{torch.cuda.device_count()} are visible."
+        )
+
     active_trace_env = {
         name: os.environ[name]
         for name in TRACE_ENV_VARS
-        if name in os.environ and os.environ[name].lower() not in {"", "0", "false", "no", "off"}
+        if name in os.environ
+        and os.environ[name].lower() not in {"", "0", "false", "no", "off"}
     }
     if active_trace_env and not args.allow_trace_env:
         names = ", ".join(sorted(active_trace_env))
@@ -185,7 +219,9 @@ def latest_frames(values: np.ndarray, index: int, count: int) -> np.ndarray:
     return np.stack(frames, axis=0)
 
 
-def load_observations(path: Path, frames_per_chunk: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def load_observations(
+    path: Path, frames_per_chunk: int
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     with np.load(path, allow_pickle=False) as source:
         missing = sorted(set(REQUIRED_TRACE_KEYS) - set(source.files))
         if missing:
@@ -224,14 +260,41 @@ def load_observations(path: Path, frames_per_chunk: int) -> tuple[list[dict[str,
     return observations, metadata
 
 
-def build_engine_and_processor(args: argparse.Namespace) -> tuple[Engine, DreamZeroProcessor]:
-    torch.cuda.set_device(0)
+def distributed_identity(*, tp_size: int, cfg_size: int) -> dict[str, int]:
+    rank = (
+        dist.get_rank() if dist.is_initialized() else int(os.environ.get("RANK", "0"))
+    )
+    world_size = tp_size * cfg_size
+    return {
+        "rank": rank,
+        "local_rank": int(os.environ.get("LOCAL_RANK", "0")),
+        "world_size": world_size,
+        "cfg_rank": rank // tp_size,
+        "tp_rank": rank % tp_size,
+    }
+
+
+def distributed_barrier() -> None:
+    if dist.is_initialized():
+        dist.barrier(device_ids=[torch.cuda.current_device()])
+
+
+def build_engine_and_processor(
+    args: argparse.Namespace,
+) -> tuple[Engine, DreamZeroProcessor]:
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.cuda.set_device(local_rank)
     torch.backends.cuda.matmul.allow_tf32 = args.allow_tf32
     torch.backends.cudnn.allow_tf32 = args.allow_tf32
+    world_size = args.cfg_size * args.tp_size
     config = EngineConfig(
         backends=BackendConfig(attn=args.attn_backend, norm=args.norm_backend),
-        device=DeviceConfig(target="cuda:0", params_dtype=torch.bfloat16),
-        parallel=ParallelConfig(world_size=1, cfg_size=1, tp_size=1),
+        device=DeviceConfig(target=f"cuda:{local_rank}", params_dtype=torch.bfloat16),
+        parallel=ParallelConfig(
+            world_size=world_size,
+            cfg_size=args.cfg_size,
+            tp_size=args.tp_size,
+        ),
         runtime=RuntimeConfig(use_cuda_graph=False),
     )
     engine = Engine(
@@ -273,6 +336,7 @@ def prepare_target_state(engine: Engine, processed: list[Any], target: int) -> N
     reset_sequence(engine)
     for index in range(target):
         engine.step(processed[index])
+    distributed_barrier()
 
 
 def cache_lengths(output: Any) -> list[int | None]:
@@ -289,6 +353,11 @@ def measure_target(
     chunk_index: int,
     cuda_profiler_range: bool,
 ) -> dict[str, Any]:
+    identity = distributed_identity(
+        tp_size=engine.config.parallel.tp_size,
+        cfg_size=engine.config.parallel.cfg_size,
+    )
+    distributed_barrier()
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     start_event = torch.cuda.Event(enable_timing=True)
@@ -298,8 +367,12 @@ def measure_target(
         result = cudart.cudaProfilerStart()
         if result != 0:
             raise RuntimeError(f"cudaProfilerStart failed with error code {result}.")
+        distributed_barrier()
 
-    torch.cuda.nvtx.range_push(f"dreamzero.engine_step.chunk_{chunk_index}")
+    torch.cuda.nvtx.range_push(
+        f"dreamzero.engine_step.chunk_{chunk_index}.rank_{identity['rank']}"
+    )
+    completed = False
     try:
         start_event.record()
         wall_started = time.perf_counter_ns()
@@ -307,17 +380,23 @@ def measure_target(
         end_event.record()
         end_event.synchronize()
         wall_ms = (time.perf_counter_ns() - wall_started) / 1e6
+        completed = True
     finally:
         torch.cuda.nvtx.range_pop()
         if cudart is not None:
+            if completed:
+                distributed_barrier()
             result = cudart.cudaProfilerStop()
             if result != 0:
                 raise RuntimeError(f"cudaProfilerStop failed with error code {result}.")
 
+    distributed_barrier()
+
     action = output.action
     lengths = cache_lengths(output)
     non_empty_lengths = [length for length in lengths if length is not None]
-    return {
+    row = {
+        **identity,
         "chunk_index": chunk_index,
         "wall_ms": wall_ms,
         "cuda_ms": float(start_event.elapsed_time(end_event)),
@@ -334,6 +413,56 @@ def measure_target(
         "dit_compute_steps": int(output.scheduler_output.dit_compute_steps),
         "scheduler_steps": int(output.scheduler_output.scheduler_steps),
     }
+    if dist.is_initialized():
+        local_metrics = torch.tensor(
+            [
+                row["wall_ms"],
+                row["cuda_ms"],
+                row["peak_allocated_mib"],
+                row["peak_reserved_mib"],
+            ],
+            dtype=torch.float64,
+            device=torch.cuda.current_device(),
+        )
+        gathered = [
+            torch.empty_like(local_metrics) for _ in range(dist.get_world_size())
+        ]
+        dist.all_gather(gathered, local_metrics)
+        rank_metrics = []
+        for rank, metrics in enumerate(gathered):
+            values = metrics.cpu().tolist()
+            rank_metrics.append(
+                {
+                    "rank": rank,
+                    "cfg_rank": rank // engine.config.parallel.tp_size,
+                    "tp_rank": rank % engine.config.parallel.tp_size,
+                    "wall_ms": values[0],
+                    "cuda_ms": values[1],
+                    "peak_allocated_mib": values[2],
+                    "peak_reserved_mib": values[3],
+                }
+            )
+        row["rank_metrics"] = rank_metrics
+        row["critical_wall_ms"] = max(item["wall_ms"] for item in rank_metrics)
+        row["critical_cuda_ms"] = max(item["cuda_ms"] for item in rank_metrics)
+    else:
+        row["rank_metrics"] = [
+            {
+                key: row[key]
+                for key in (
+                    "rank",
+                    "cfg_rank",
+                    "tp_rank",
+                    "wall_ms",
+                    "cuda_ms",
+                    "peak_allocated_mib",
+                    "peak_reserved_mib",
+                )
+            }
+        ]
+        row["critical_wall_ms"] = row["wall_ms"]
+        row["critical_cuda_ms"] = row["cuda_ms"]
+    return row
 
 
 def package_version(name: str) -> str | None:
@@ -354,7 +483,8 @@ def git_value(*args: str) -> str | None:
 
 
 def environment_manifest(args: argparse.Namespace) -> dict[str, Any]:
-    properties = torch.cuda.get_device_properties(0)
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    properties = torch.cuda.get_device_properties(local_rank)
     return {
         "git_commit": git_value("rev-parse", "HEAD"),
         "git_status": git_value("status", "--short", "--untracked-files=no"),
@@ -367,6 +497,8 @@ def environment_manifest(args: argparse.Namespace) -> dict[str, Any]:
         "gpu_compute_capability": f"{properties.major}.{properties.minor}",
         "gpu_total_memory_mib": properties.total_memory / (1024**2),
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "rank": int(os.environ.get("RANK", "0")),
+        "local_rank": local_rank,
         "tf32": args.allow_tf32,
         "trace_environment": {
             name: os.environ[name] for name in TRACE_ENV_VARS if name in os.environ
@@ -375,34 +507,34 @@ def environment_manifest(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    wall = np.asarray([row["wall_ms"] for row in rows], dtype=np.float64)
-    cuda = np.asarray([row["cuda_ms"] for row in rows], dtype=np.float64)
+    wall = np.asarray([row["critical_wall_ms"] for row in rows], dtype=np.float64)
+    cuda = np.asarray([row["critical_cuda_ms"] for row in rows], dtype=np.float64)
     wall_mean = float(np.mean(wall))
     return {
         "samples": len(rows),
-        "wall_mean_ms": wall_mean,
-        "wall_median_ms": float(np.median(wall)),
-        "wall_p95_ms": float(np.percentile(wall, 95)),
-        "wall_min_ms": float(np.min(wall)),
-        "wall_max_ms": float(np.max(wall)),
-        "wall_stdev_ms": float(statistics.stdev(wall)) if len(rows) > 1 else 0.0,
-        "wall_cv": (
+        "critical_wall_mean_ms": wall_mean,
+        "critical_wall_median_ms": float(np.median(wall)),
+        "critical_wall_p95_ms": float(np.percentile(wall, 95)),
+        "critical_wall_min_ms": float(np.min(wall)),
+        "critical_wall_max_ms": float(np.max(wall)),
+        "critical_wall_stdev_ms": (
+            float(statistics.stdev(wall)) if len(rows) > 1 else 0.0
+        ),
+        "critical_wall_cv": (
             float(statistics.stdev(wall) / wall_mean)
             if len(rows) > 1 and wall_mean
             else 0.0
         ),
-        "cuda_mean_ms": float(np.mean(cuda)),
-        "cuda_median_ms": float(np.median(cuda)),
-        "cuda_p95_ms": float(np.percentile(cuda, 95)),
+        "critical_cuda_mean_ms": float(np.mean(cuda)),
+        "critical_cuda_median_ms": float(np.median(cuda)),
+        "critical_cuda_p95_ms": float(np.percentile(cuda, 95)),
     }
 
 
 def main() -> None:
     args = parse_args()
     validate_args(args)
-    observations, input_metadata = load_observations(
-        args.input, args.frames_per_chunk
-    )
+    observations, input_metadata = load_observations(args.input, args.frames_per_chunk)
     if args.chunk_index >= len(observations):
         raise ValueError(
             f"--chunk-index {args.chunk_index} is outside the trace with "
@@ -416,6 +548,11 @@ def main() -> None:
         "video_shape": list(observations[args.chunk_index]["video"].shape),
         "state_shape": list(observations[args.chunk_index]["state"].shape),
         "prefix_chunks": args.chunk_index,
+        "requested_topology": {
+            "tp_size": args.tp_size,
+            "cfg_size": args.cfg_size,
+            "world_size": args.tp_size * args.cfg_size,
+        },
         "metadata": input_metadata,
     }
     if args.validate_input_only:
@@ -425,6 +562,7 @@ def main() -> None:
 
     engine, processor = build_engine_and_processor(args)
     try:
+        identity = distributed_identity(tp_size=args.tp_size, cfg_size=args.cfg_size)
         processed = [processor.preprocess(observation) for observation in observations]
         for _ in range(args.warmup_runs):
             prepare_target_state(engine, processed, args.chunk_index)
@@ -453,8 +591,12 @@ def main() -> None:
                         cuda_profiler_range=False,
                     )
                 )
-            profiler_trace_path = args.output_dir / "torch_trace.json"
-            profiler_table_path = args.output_dir / "torch_key_averages.txt"
+            profiler_trace_path = args.output_dir / (
+                f"torch_trace.rank{identity['rank']}.json"
+            )
+            profiler_table_path = args.output_dir / (
+                f"torch_key_averages.rank{identity['rank']}.txt"
+            )
             profiler.export_chrome_trace(str(profiler_trace_path))
             profiler_table_path.write_text(
                 profiler.key_averages(group_by_input_shape=True).table(
@@ -474,7 +616,8 @@ def main() -> None:
                 )
                 row["repetition"] = repetition
                 rows.append(row)
-                print(json.dumps(row, sort_keys=True), flush=True)
+                if identity["rank"] == 0:
+                    print(json.dumps(row, sort_keys=True), flush=True)
 
         summary = {
             "scope": "in-process engine.step(processed); preprocessing excluded",
@@ -493,24 +636,38 @@ def main() -> None:
                 "attn_backend": args.attn_backend,
                 "norm_backend": args.norm_backend,
                 "dtype": "bfloat16",
-                "world_size": 1,
+                "world_size": args.tp_size * args.cfg_size,
+                "tp_size": args.tp_size,
+                "cfg_size": args.cfg_size,
                 "cuda_graph": False,
                 "sequential_cpu_offload": args.sequential_cpu_offload,
             },
             "environment": environment_manifest(args),
             "aggregate": aggregate(rows),
             "rows": rows,
-            "torch_profiler_trace": (
-                str(profiler_trace_path) if profiler_trace_path is not None else None
+            "torch_profiler_traces": (
+                [
+                    str(args.output_dir / f"torch_trace.rank{rank}.json")
+                    for rank in range(identity["world_size"])
+                ]
+                if profiler_trace_path is not None
+                else None
             ),
-            "torch_profiler_table": (
-                str(profiler_table_path) if profiler_table_path is not None else None
+            "torch_profiler_tables": (
+                [
+                    str(args.output_dir / f"torch_key_averages.rank{rank}.txt")
+                    for rank in range(identity["world_size"])
+                ]
+                if profiler_table_path is not None
+                else None
             ),
         }
-        summary_path = args.output_dir / "summary.json"
-        summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-        print(json.dumps(summary["aggregate"], indent=2), flush=True)
-        print(f"Wrote {summary_path}", flush=True)
+        distributed_barrier()
+        if identity["rank"] == 0:
+            summary_path = args.output_dir / "summary.json"
+            summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+            print(json.dumps(summary["aggregate"], indent=2), flush=True)
+            print(f"Wrote {summary_path}", flush=True)
     finally:
         engine.close()
 
