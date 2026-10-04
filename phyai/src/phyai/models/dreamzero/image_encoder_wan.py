@@ -9,7 +9,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from phyai.engine_config import ParallelConfig
+from phyai.layers.linear import ReplicatedLinear
+from phyai.layers.mlp import DenseMLP
 from phyai.models.dreamzero.configuration_dreamzero import DreamZeroImageEncoderConfig
+from phyai.parallel.layout import build_rank_layout
+from phyai.parallel.mesh import Mesh
 from phyai.weights.shards import replicated
 
 
@@ -20,8 +25,23 @@ CLIP_IMAGE_STD = (0.26862954, 0.26130258, 0.27577711)
 def attach_replicated_image_encoder_weights(module: nn.Module) -> None:
     """Attach phyai weight-loader metadata to all image encoder parameters."""
     for name, param in module.named_parameters():
-        param.hf_keys = [(name, None)]
-        param.weight_loader = replicated()
+        if not hasattr(param, "weight_loader"):
+            param.hf_keys = [(name, None)]
+            param.weight_loader = replicated()
+    # Keep the official split fc1/fc2/fc3 keys and the fused gate/up loaders.
+    for name, child in module.named_modules():
+        if isinstance(child, DenseMLP) and child.gated:
+            prefix = f"{name}." if name else ""
+            for suffix in ("weight", "bias"):
+                gate_up = getattr(child.gate_up_proj, suffix)
+                down = getattr(child.down_proj, suffix)
+                if gate_up is not None:
+                    gate_up.hf_keys = [
+                        (f"{prefix}fc1.{suffix}", 0),
+                        (f"{prefix}fc2.{suffix}", 1),
+                    ]
+                if down is not None:
+                    down.hf_keys = [(f"{prefix}fc3.{suffix}", None)]
 
 
 def dreamzero_image_encoder_weight_remap(name: str) -> str | None:
@@ -72,6 +92,16 @@ class CLIPLayerNorm(nn.LayerNorm):
         return super().forward(x).type_as(x)
 
 
+class CLIPMLP(nn.Sequential):
+    """Keep checkpoint indices while unpacking the phyai linear outputs."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x, _ = self[0](x)
+        x = self[1](x)
+        x, _ = self[2](x)
+        return self[3](x)
+
+
 class CLIPSelfAttention(nn.Module):
     def __init__(
         self,
@@ -90,32 +120,22 @@ class CLIPSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.attn_dropout = attn_dropout
         self.proj_dropout = proj_dropout
-        self.to_qkv = nn.Linear(dim, dim * 3, dtype=params_dtype)
-        self.proj = nn.Linear(dim, dim, dtype=params_dtype)
+        self.to_qkv = ReplicatedLinear(
+            dim, dim * 3, params_dtype=params_dtype, device="cpu"
+        )
+        self.proj = ReplicatedLinear(dim, dim, params_dtype=params_dtype, device="cpu")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        q, k, v = self.to_qkv(x).chunk(3, dim=-1)
+        qkv, _ = self.to_qkv(x)
+        q, k, v = qkv.chunk(3, dim=-1)
         q = rearrange(q, "b s (n d) -> b n s d", n=self.num_heads)
         k = rearrange(k, "b s (n d) -> b n s d", n=self.num_heads)
         v = rearrange(v, "b s (n d) -> b n s d", n=self.num_heads)
         x = F.scaled_dot_product_attention(q, k, v)
         x = rearrange(x, "b n s d -> b s (n d)", n=self.num_heads)
-        x = self.proj(x)
+        x, _ = self.proj(x)
         x = F.dropout(x, self.proj_dropout, self.training)
         return x
-
-
-class SwiGLU(nn.Module):
-    def __init__(
-        self, dim: int, mid_dim: int, *, params_dtype: torch.dtype = torch.float32
-    ) -> None:
-        super().__init__()
-        self.fc1 = nn.Linear(dim, mid_dim, dtype=params_dtype)
-        self.fc2 = nn.Linear(dim, mid_dim, dtype=params_dtype)
-        self.fc3 = nn.Linear(mid_dim, dim, dtype=params_dtype)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc3(F.silu(self.fc1(x)) * self.fc2(x))
 
 
 class CLIPAttentionBlock(nn.Module):
@@ -147,12 +167,25 @@ class CLIPAttentionBlock(nn.Module):
         self.norm2 = CLIPLayerNorm(dim, eps=norm_eps, dtype=params_dtype)
         mid_dim = int(dim * mlp_ratio)
         if activation == "swi_glu":
-            self.mlp = SwiGLU(dim, mid_dim, params_dtype=params_dtype)
+            # Encoders can run only on rank 0; never join the DiT TP collectives.
+            encoder_mesh = Mesh(
+                build_rank_layout(ParallelConfig()), name="dreamzero_image_encoder"
+            )
+            self.mlp = DenseMLP(
+                dim,
+                mid_dim,
+                activation="silu",
+                gated=True,
+                bias=True,
+                sequence_parallel=False,
+                params_dtype=params_dtype,
+                mesh=encoder_mesh,
+            )
         else:
-            self.mlp = nn.Sequential(
-                nn.Linear(dim, mid_dim, dtype=params_dtype),
+            self.mlp = CLIPMLP(
+                ReplicatedLinear(dim, mid_dim, params_dtype=params_dtype, device="cpu"),
                 QuickGELU() if activation == "quick_gelu" else nn.GELU(),
-                nn.Linear(mid_dim, dim, dtype=params_dtype),
+                ReplicatedLinear(mid_dim, dim, params_dtype=params_dtype, device="cpu"),
                 nn.Dropout(proj_dropout),
             )
 
@@ -188,28 +221,32 @@ class CLIPAttentionPool(nn.Module):
         self.cls_embedding = nn.Parameter(
             gain * torch.randn(1, 1, dim, dtype=params_dtype)
         )
-        self.to_q = nn.Linear(dim, dim, dtype=params_dtype)
-        self.to_kv = nn.Linear(dim, dim * 2, dtype=params_dtype)
-        self.proj = nn.Linear(dim, dim, dtype=params_dtype)
+        self.to_q = ReplicatedLinear(dim, dim, params_dtype=params_dtype, device="cpu")
+        self.to_kv = ReplicatedLinear(
+            dim, dim * 2, params_dtype=params_dtype, device="cpu"
+        )
+        self.proj = ReplicatedLinear(dim, dim, params_dtype=params_dtype, device="cpu")
         self.norm = CLIPLayerNorm(dim, eps=norm_eps, dtype=params_dtype)
         mid_dim = int(dim * mlp_ratio)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, mid_dim, dtype=params_dtype),
+        self.mlp = CLIPMLP(
+            ReplicatedLinear(dim, mid_dim, params_dtype=params_dtype, device="cpu"),
             QuickGELU() if activation == "quick_gelu" else nn.GELU(),
-            nn.Linear(mid_dim, dim, dtype=params_dtype),
+            ReplicatedLinear(mid_dim, dim, params_dtype=params_dtype, device="cpu"),
             nn.Dropout(proj_dropout),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch, _, dim = x.shape
-        q = self.to_q(self.cls_embedding).expand(batch, -1, -1)
-        k, v = self.to_kv(x).chunk(2, dim=-1)
+        q, _ = self.to_q(self.cls_embedding)
+        q = q.expand(batch, -1, -1)
+        kv, _ = self.to_kv(x)
+        k, v = kv.chunk(2, dim=-1)
         q = q.view(batch, 1, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.view(batch, -1, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch, -1, self.num_heads, self.head_dim).transpose(1, 2)
         x = F.scaled_dot_product_attention(q, k, v)
         x = x.transpose(1, 2).reshape(batch, 1, dim)
-        x = self.proj(x)
+        x, _ = self.proj(x)
         x = F.dropout(x, self.proj_dropout, self.training)
         x = x + self.mlp(self.norm(x))
         return x[:, 0]
@@ -284,8 +321,11 @@ class WanCLIPVisionTransformer(nn.Module):
                 * torch.randn(config.vision_dim, config.embed_dim, dtype=params_dtype)
             )
         elif config.vision_pool == "token_fc":
-            self.head = nn.Linear(
-                config.vision_dim, config.embed_dim, dtype=params_dtype
+            self.head = ReplicatedLinear(
+                config.vision_dim,
+                config.embed_dim,
+                params_dtype=params_dtype,
+                device="cpu",
             )
         else:
             self.head = CLIPAttentionPool(

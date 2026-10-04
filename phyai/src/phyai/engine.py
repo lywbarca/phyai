@@ -291,7 +291,9 @@ class EngineCore:
         # 4. Initialize CUDA and cuBLAS.
         with self._stage("cuda"):
             init_cuda(self.config.device.target, self.config.device.params_dtype)
-            init_cublas()
+            init_cublas(allow_tf32=self.config.runtime.allow_tf32)
+            if self.config.runtime.allow_cudnn_tf32 is not None:
+                torch.backends.cudnn.allow_tf32 = self.config.runtime.allow_cudnn_tf32
 
         # 5. Initialize the distributed process group.
         with self._stage("dist"):

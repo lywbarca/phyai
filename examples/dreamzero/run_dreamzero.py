@@ -112,8 +112,6 @@ def load_observation(args: argparse.Namespace) -> dict:
 def main() -> None:
     args = parse_args()
     observation = load_observation(args)
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
     engine = Engine(
         EngineArgs(
             plugin="dreamzero",
@@ -130,7 +128,11 @@ def main() -> None:
             ),
             config=EngineConfig(
                 device=DeviceConfig(target=args.device, params_dtype=torch.bfloat16),
-                runtime=RuntimeConfig(use_cuda_graph=False),
+                runtime=RuntimeConfig(
+                    use_cuda_graph=False,
+                    allow_tf32=False,
+                    allow_cudnn_tf32=False,
+                ),
                 kernel=KernelConfig(config_path=args.kernel_config),
             ),
         )
