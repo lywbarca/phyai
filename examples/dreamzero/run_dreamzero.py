@@ -1,4 +1,8 @@
-"""Run one initial DreamZero-DROID action chunk from three RGB images."""
+"""Run one DreamZero-DROID chunk with synthetic or caller-provided inputs.
+
+The default uses random RGB images and zero state to check the inference path.
+Predicted actions from synthetic observations have no task-level meaning.
+"""
 
 from __future__ import annotations
 
@@ -20,14 +24,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__,
         epilog=(
-            "Example: uv run python examples/dreamzero/run_dreamzero.py "
-            "--checkpoint /path/to/DreamZero-DROID "
-            "--tokenizer /path/to/umt5-xxl "
-            "--right-image right.png --left-image left.png --wrist-image wrist.png "
-            "--state 0 0 0 0 0 0 0 0 --task 'Pick up the object' "
-            "--output action.npy. "
-            "Replace the sample state with seven measured joint positions and "
-            "one gripper position. This runs a fresh sequence, not a robot control loop."
+            "Inputs default to random RGB images and zero state. "
+            "Example: python examples/dreamzero/run_dreamzero.py "
+            "--checkpoint /path/to/DreamZero-DROID --tokenizer /path/to/umt5-xxl. "
+            "This runs a fresh sequence, not a robot control loop."
         ),
     )
     parser.add_argument("--checkpoint", type=Path, required=True)
@@ -36,17 +36,18 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="UMT5 tokenizer directory or Hugging Face ID.",
     )
-    parser.add_argument("--right-image", type=Path, required=True)
-    parser.add_argument("--left-image", type=Path, required=True)
-    parser.add_argument("--wrist-image", type=Path, required=True)
+    parser.add_argument("--right-image", type=Path)
+    parser.add_argument("--left-image", type=Path)
+    parser.add_argument("--wrist-image", type=Path)
     parser.add_argument(
         "--state",
         type=float,
         nargs=8,
-        required=True,
         help="Seven DROID joint positions followed by gripper position.",
     )
-    parser.add_argument("--task", required=True)
+    parser.add_argument(
+        "--task", help="Language instruction; synthetic default: Pick up the object."
+    )
     parser.add_argument(
         "--device", default="cuda:0", help="CUDA device within CUDA_VISIBLE_DEVICES."
     )
@@ -59,8 +60,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--dynamic-dit",
-        action="store_true",
-        help="Use the 16-step dynamic schedule instead of --steps.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use the 16-step dynamic schedule (default); --no-dynamic-dit selects --steps.",
     )
     parser.add_argument(
         "--compile-scheduler",
@@ -84,16 +86,37 @@ def parse_args() -> argparse.Namespace:
         parser.error("--checkpoint must be an existing DreamZero-DROID directory.")
     if args.steps <= 0:
         parser.error("--steps must be positive.")
-    if not args.task.strip():
-        parser.error("--task must not be empty.")
-    if not np.isfinite(args.state).all():
-        parser.error("--state must contain only finite values.")
+    real_images = (args.right_image, args.left_image, args.wrist_image)
+    args.synthetic = all(p is None for p in real_images)
+    if args.synthetic:
+        if args.state is None:
+            args.state = [0.0] * 8
+        if args.task is None:
+            args.task = "Pick up the object"
+    elif any(p is None for p in real_images):
+        parser.error("Real observations require all three camera images.")
+    if not isinstance(args.task, str) or not args.task.strip():
+        parser.error("task must be a non-empty string.")
+    try:
+        state = np.asarray(args.state, dtype=np.float32)
+        if state.shape != (8,) or not np.isfinite(state).all():
+            raise ValueError("expected eight finite state values")
+    except (ValueError, TypeError) as error:
+        parser.error(f"Invalid observation state: {error}")
+    args.state = state.tolist()
     if torch.device(args.device).type != "cuda":
         parser.error("This example requires a CUDA device.")
     return args
 
 
 def load_observation(args: argparse.Namespace) -> dict:
+    if args.synthetic:
+        rng = np.random.default_rng(args.seed)
+        return {
+            "video": rng.integers(0, 256, size=(1, 1, 3, 180, 320, 3), dtype=np.uint8),
+            "state": torch.tensor(args.state, dtype=torch.float32).reshape(1, 1, 8),
+            "task": [args.task],
+        }
     images = []
     for path in (args.right_image, args.left_image, args.wrist_image):
         with Image.open(path) as image:
@@ -110,6 +133,8 @@ def load_observation(args: argparse.Namespace) -> dict:
 def main() -> None:
     args = parse_args()
     observation = load_observation(args)
+    if args.synthetic:
+        print("Synthetic observation: random RGB images; output checks execution only.")
     engine = Engine(
         EngineArgs(
             plugin="dreamzero",

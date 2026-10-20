@@ -48,6 +48,13 @@
                 ]
               },
               {
+                "group": "DreamZero",
+                "pages": [
+                  "models/dreamzero/ws1",
+                  "models/dreamzero/accuracy-parity"
+                ]
+              },
+              {
                 "group": "MolmoAct2",
                 "pages": [
                   "models/molmoact2/inference"
@@ -130,6 +137,13 @@
                   "zh/models/gr00t/ws1",
                   "zh/models/gr00t/n17-accuracy-parity",
                   "zh/models/gr00t/n17-libero-closed-loop"
+                ]
+              },
+              {
+                "group": "DreamZero",
+                "pages": [
+                  "zh/models/dreamzero/ws1",
+                  "zh/models/dreamzero/accuracy-parity"
                 ]
               },
               {
