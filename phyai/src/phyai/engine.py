@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import abc
+import importlib
 import os
 import time
 import threading
@@ -42,6 +43,19 @@ from phyai.runtime.tensor_dump import (
 )
 
 logger = get_logger(__name__)
+
+
+_BUILTIN_PLUGIN_MODULES: dict[str, str] = {
+    "pi0": "phyai.models.pi0.main_pi0",
+    "pi05": "phyai.models.pi05.main_pi05",
+    "cosmos3": "phyai.models.cosmos3.main_cosmos3",
+    "cosmos3_policy": "phyai.models.cosmos3.main_cosmos3_policy",
+    "cosmos3_staged": "phyai.models.cosmos3.main_cosmos3_staged",
+    "gr00t_n17": "phyai.models.gr00t_n17.main_gr00t_n17",
+    "qwen_image_21": "phyai.models.qwen_image_21.main_qwen_image_21",
+    "minicpm_gr00t": "phyai.models.minicpm_gr00t.main_minicpm_gr00t",
+    "dreamzero": "phyai.models.dreamzero.main_dreamzero",
+}
 
 
 def _runtime_replica_world_size(parallel: ParallelConfig) -> int:
@@ -265,27 +279,26 @@ class EngineCore:
 
     @classmethod
     def registered(cls) -> tuple[str, ...]:
-        """Return all registered plugin names in registration order."""
-        return tuple(cls._plugins.keys())
+        """Return all available plugin names in registration order."""
+        return tuple(dict.fromkeys((*_BUILTIN_PLUGIN_MODULES, *cls._plugins)))
 
     @classmethod
     def plugin_class(cls, name: str) -> type[Entry]:
-        """Resolve one preinstalled plugin without importing wire-provided code."""
+        """Load and resolve one built-in or explicitly registered plugin."""
+        module_name = _BUILTIN_PLUGIN_MODULES.get(name)
+        if name not in cls._plugins and module_name is not None:
+            importlib.import_module(module_name)
         try:
             return cls._plugins[name]
         except KeyError as error:
             raise ValueError(
-                f"unknown plugin {name!r}; registered: {list(cls._plugins)!r}."
+                f"unknown plugin {name!r}; registered: {list(cls.registered())!r}."
             ) from error
 
     def __init__(self, args: EngineArgs) -> None:
         # Resolve the plugin contract before touching CUDA or distributed state.
         # Invalid public arguments should fail without allocating a process group.
-        entry_cls = self._plugins.get(args.plugin)
-        if entry_cls is None:
-            raise ValueError(
-                f"unknown plugin {args.plugin!r}; registered: {list(self._plugins)!r}."
-            )
+        entry_cls = self.plugin_class(args.plugin)
         if not isinstance(args.plugin_args, entry_cls.args_cls):
             raise TypeError(
                 f"plugin {entry_cls.name!r} expects "
@@ -667,11 +680,7 @@ class Engine:
         deployment_config = deployment or DeploymentConfig()
         resolved = _resolve_engine_config(args)
         resolved_args = replace(args, config=resolved)
-        entry_cls = self._plugins.get(args.plugin)
-        if entry_cls is None:
-            raise ValueError(
-                f"unknown plugin {args.plugin!r}; registered: {list(self._plugins)!r}."
-            )
+        entry_cls = EngineCore.plugin_class(args.plugin)
         if not isinstance(args.plugin_args, entry_cls.args_cls):
             raise TypeError(
                 f"plugin {entry_cls.name!r} expects "
@@ -825,20 +834,3 @@ __all__ = [
     "Entry",
     "EntryArgs",
 ]
-
-
-# Import plugin modules after defining Engine so their decorators register
-# each Entry subclass. Add new plugin imports here.
-
-from phyai.models.pi0 import main_pi0 as _main_pi0  # noqa: E402, F401
-from phyai.models.pi05 import main_pi05 as _main_pi05  # noqa: E402, F401
-from phyai.models.cosmos3 import main_cosmos3 as _main_cosmos3  # noqa: E402, F401
-from phyai.models.cosmos3 import (  # noqa: E402, F401
-    main_cosmos3_policy as _main_cosmos3_policy,
-)
-from phyai.models.gr00t_n17 import main_gr00t_n17 as _main_gr00t_n17  # noqa: E402, F401
-from phyai.models.qwen_image_21 import main_qwen_image_21 as _main_qwen_image_21  # noqa: E402, F401
-from phyai.models.minicpm_gr00t import (  # noqa: E402, F401
-    main_minicpm_gr00t as _main_minicpm_gr00t,
-)
-from phyai.models.dreamzero import main_dreamzero as _main_dreamzero  # noqa: E402, F401

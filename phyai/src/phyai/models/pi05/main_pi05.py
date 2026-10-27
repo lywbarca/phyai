@@ -14,9 +14,8 @@ Two pieces, both consumed by :class:`~phyai.engine.Engine`:
   :class:`PI05Scheduler`, then forwards :meth:`step` to it.
 
 Importing this module registers ``PI05Entry`` with the engine via
-``@Engine.register`` at class-definition time. The engine's own
-``engine.py`` imports this module at the bottom of its file, so the
-plugin is available the moment the engine module is loaded.
+``@Engine.register`` at class-definition time. The engine loads this module
+on demand when the ``pi05`` plugin is selected.
 
 ``device`` / ``params_dtype`` / ``*_backend`` / ``use_cuda_graph`` are
 *not* fields on :class:`PI05Args`; they live on

@@ -48,6 +48,7 @@ def _torch(name: str, *, gated: bool):
         import torch
 
         activations = {
+            "situ": lambda value: 4.0 * torch.tanh(value / 4.0) * torch.sigmoid(value),
             "silu": torch.nn.functional.silu,
             "gelu": lambda value: torch.nn.functional.gelu(value, approximate="none"),
             "gelu_tanh": lambda value: torch.nn.functional.gelu(
@@ -70,6 +71,8 @@ def _torch(name: str, *, gated: bool):
             if not gated:
                 return activate(value)
             lhs, rhs = value.chunk(2, dim=-1)
+            if name == "situ":
+                rhs = 25.0 * torch.tanh(rhs / 25.0)
             return activate(lhs) * rhs
 
         return execute
@@ -83,6 +86,12 @@ def _t5_gelu(facts, params):
     return t5_gelu
 
 
+def _triton_situ(facts, params):
+    from phyai_kernel import situ_and_mul
+
+    return situ_and_mul
+
+
 FLASHINFER_KERNELS = (
     ("silu", "silu_and_mul"),
     ("gelu", "gelu_and_mul"),
@@ -90,6 +99,7 @@ FLASHINFER_KERNELS = (
 )
 
 TORCH_KERNELS = (
+    ("situ", True, "situ_and_mul"),
     ("silu", False, "silu"),
     ("gelu", False, "gelu"),
     ("gelu_tanh", False, "gelu_tanh"),
@@ -136,6 +146,24 @@ def register(catalog: Catalog) -> None:
                     "package": "phyai_kernel",
                     "activation": "t5_gelu",
                     "gated": False,
+                },
+            ),
+            Impl(
+                kernel_id="phyai_kernel.activation.situ_and_mul",
+                op="activation",
+                priority=Priority.OPTIMIZED,
+                when=all_of(
+                    lib.has("phyai_kernel"),
+                    device.vendor == "nvidia",
+                    dtype.input.in_({"bf16", "fp16", "fp32"}),
+                    attrs.activation == "situ",
+                    attrs.gated,
+                ),
+                prepare=_triton_situ,
+                metadata={
+                    "package": "phyai-kernel",
+                    "activation": "situ",
+                    "gated": True,
                 },
             ),
         )
