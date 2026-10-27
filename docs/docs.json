@@ -50,8 +50,7 @@
               {
                 "group": "DreamZero",
                 "pages": [
-                  "models/dreamzero/ws1",
-                  "models/dreamzero/accuracy-parity"
+                  "models/dreamzero/ws1"
                 ]
               },
               {
@@ -142,8 +141,7 @@
               {
                 "group": "DreamZero",
                 "pages": [
-                  "zh/models/dreamzero/ws1",
-                  "zh/models/dreamzero/accuracy-parity"
+                  "zh/models/dreamzero/ws1"
                 ]
               },
               {
